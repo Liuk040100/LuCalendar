@@ -11,6 +11,17 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// Configurazione log per debugging
+const DEBUG = process.env.NODE_ENV !== 'production';
+
+function logDebug(...args) {
+  if (DEBUG) console.log('[DEBUG]', ...args);
+}
+
+function logError(...args) {
+  console.error('[ERROR]', ...args);
+}
+
 // Google OAuth setup
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -48,7 +59,7 @@ app.get('/api/auth/callback', async (req, res) => {
     // Redirect al frontend
     res.redirect(`${process.env.CLIENT_URL}?auth=success`);
   } catch (error) {
-    console.error('Errore di autenticazione:', error);
+    logError('Errore di autenticazione:', error);
     res.redirect(`${process.env.CLIENT_URL}?auth=error`);
   }
 });
@@ -71,7 +82,7 @@ app.post('/api/process-command', async (req, res) => {
     
     res.json({ result: geminiResponse });
   } catch (error) {
-    console.error('Errore nell\'elaborazione del comando:', error);
+    logError('Errore nell\'elaborazione del comando:', error);
     res.status(500).json({ 
       error: 'Errore nell\'elaborazione del comando',
       details: error.message 
@@ -81,50 +92,172 @@ app.post('/api/process-command', async (req, res) => {
 
 // Funzione per elaborare comandi con Gemini
 async function processWithGemini(command, calendarClient) {
+  // Endpoint corretto verificato
+  const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent';
+  
+  // Prompt di sistema per Gemini
+  const systemPrompt = `Sei un assistente che aiuta a gestire il calendario Google. 
+  Interpreta il comando dell'utente per determinare quale operazione eseguire:
+  1. Crea evento
+  2. Modifica evento
+  3. Visualizza eventi
+  4. Elimina evento
+  5. Altro (specificare)
+  
+  Per ogni comando, estrai i dettagli pertinenti come data, ora, titolo, descrizione, partecipanti, ecc.
+  Rispondi in formato JSON con i campi "action" e "parameters".`;
+
   try {
-    // Prompt di sistema per Gemini
-    const systemPrompt = `Sei un assistente che aiuta a gestire il calendario Google. 
-    Interpreta il comando dell'utente per determinare quale operazione eseguire:
-    1. Crea evento
-    2. Modifica evento
-    3. Visualizza eventi
-    4. Elimina evento
-    5. Altro (specificare)
+    logDebug('Invio richiesta a Gemini API:', GEMINI_ENDPOINT);
+    logDebug('Comando:', command);
     
-    Per ogni comando, estrai i dettagli pertinenti come data, ora, titolo, descrizione, partecipanti, ecc.
-    Rispondi in formato JSON con i campi "action" e "parameters".`;
+    // Chiamata all'API Gemini
+    const response = await axios.post(
+      GEMINI_ENDPOINT,
+      {
+        contents: [{
+          parts: [
+            { text: systemPrompt },
+            { text: command }
+          ]
+        }],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 1024,
+          topP: 0.8
+        }
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': process.env.GEMINI_API_KEY
+        }
+      }
+    );
 
-    // Chiamata a Gemini API
-const response = await axios.post(
-  'https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent',
-  {
-    contents: [{
-      parts: [
-        { text: systemPrompt },
-        { text: command }
-      ]
-    }],
-    generationConfig: {
-      temperature: 0.2
-    }
-  },
-  {
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': process.env.GEMINI_API_KEY
-    }
-  }
-);
-
-const geminiResult = response.data.candidates[0].content.parts[0].text;
-    const parsedResult = JSON.parse(geminiResult);
+    logDebug('Risposta ricevuta da Gemini API');
     
-    // Esegui l'azione appropriata sul calendario in base all'interpretazione di Gemini
-    return await executeCalendarAction(parsedResult, calendarClient);
+    // Estrai il testo dalla risposta
+    if (!response.data.candidates || !response.data.candidates[0] || 
+        !response.data.candidates[0].content || !response.data.candidates[0].content.parts) {
+      throw new Error('Formato risposta Gemini non valido');
+    }
+    
+    const geminiResult = response.data.candidates[0].content.parts[0].text;
+    
+    // Pulisci il testo della risposta (rimuovi backtick se presenti)
+    const cleanedResult = geminiResult.replace(/```json/g, '').replace(/```/g, '').trim();
+    
+    try {
+      // Parsing della risposta JSON
+      const parsedResult = JSON.parse(cleanedResult);
+      logDebug('Interpretazione comando:', parsedResult);
+      
+      // Esegui l'azione appropriata sul calendario
+      return await executeCalendarAction(parsedResult, calendarClient);
+    } catch (parseError) {
+      logError('Errore nel parsing JSON della risposta:', cleanedResult);
+      logError('Dettaglio errore:', parseError);
+      
+      // Fallback a un parser locale semplice
+      logDebug('Utilizzo parser locale di fallback');
+      const fallbackResult = basicCommandParser(command);
+      return await executeCalendarAction(fallbackResult, calendarClient);
+    }
   } catch (error) {
-    console.error('Errore nella comunicazione con Gemini:', error);
-    throw new Error('Impossibile interpretare il comando');
+    logError('Errore nella comunicazione con Gemini:', error.message);
+    
+    if (error.response) {
+      logError('Dettagli risposta errore:', {
+        status: error.response.status,
+        statusText: error.response.statusText,
+        data: error.response.data
+      });
+    }
+    
+    // Fallback a un parser locale semplice se l'API fallisce
+    logDebug('Utilizzo parser locale di fallback');
+    const fallbackResult = basicCommandParser(command);
+    return await executeCalendarAction(fallbackResult, calendarClient);
   }
+}
+
+// Parser locale di base come fallback
+function basicCommandParser(command) {
+  logDebug('Parsing locale del comando:', command);
+  const lowerCommand = command.toLowerCase();
+  let action = null;
+  let parameters = {};
+  
+  // Estrazione del titolo
+  const titleMatch = command.match(/chiamat[oa]\s+([^,\.]+)/i) || 
+                     command.match(/intitolat[oa]\s+([^,\.]+)/i) ||
+                     command.match(/\b(evento|riunione|appuntamento)\s+([^,\.]+)/i);
+  
+  const title = titleMatch ? (titleMatch[1] || titleMatch[2]).trim() : 'Nuovo evento';
+  
+  // Estrazione base della data e ora
+  const timeMatch = command.match(/(\d{1,2})[:\.](\d{2})/);
+  const hourMatch = command.match(/\b(\d{1,2})\s*(am|pm|del mattino|del pomeriggio|di sera)/i);
+  
+  // Calcola data/ora base per eventi
+  const now = new Date();
+  const startDateTime = new Date(now);
+  
+  if (timeMatch) {
+    startDateTime.setHours(parseInt(timeMatch[1]), parseInt(timeMatch[2]), 0);
+  } else if (hourMatch) {
+    let hour = parseInt(hourMatch[1]);
+    const period = hourMatch[2].toLowerCase();
+    if ((period === 'pm' || period.includes('pomeriggio') || period.includes('sera')) && hour < 12) {
+      hour += 12;
+    }
+    startDateTime.setHours(hour, 0, 0);
+  }
+  
+  const endDateTime = new Date(startDateTime);
+  endDateTime.setHours(endDateTime.getHours() + 1);
+  
+  // Determina l'azione in base alle parole chiave
+  if (lowerCommand.includes('crea') || lowerCommand.includes('nuovo') || 
+      lowerCommand.includes('aggiungi') || lowerCommand.includes('fissa')) {
+    action = 'CREATE_EVENT';
+    parameters = {
+      title: title,
+      startDateTime: startDateTime.toISOString(),
+      endDateTime: endDateTime.toISOString(),
+      description: ''
+    };
+  } else if (lowerCommand.includes('mostra') || lowerCommand.includes('visualizza') || 
+             lowerCommand.includes('elenco') || lowerCommand.includes('vedi')) {
+    action = 'VIEW_EVENTS';
+    parameters = {
+      maxResults: 10
+    };
+  } else if (lowerCommand.includes('modifica') || lowerCommand.includes('sposta') || 
+             lowerCommand.includes('cambia') || lowerCommand.includes('aggiorna')) {
+    action = 'UPDATE_EVENT';
+    parameters = {
+      title: title,
+      startDateTime: startDateTime.toISOString(),
+      endDateTime: endDateTime.toISOString()
+    };
+  } else if (lowerCommand.includes('elimina') || lowerCommand.includes('cancella') || 
+             lowerCommand.includes('rimuovi')) {
+    action = 'DELETE_EVENT';
+    parameters = {
+      title: title
+    };
+  } else {
+    // Default: visualizza eventi
+    action = 'VIEW_EVENTS';
+    parameters = {
+      maxResults: 10
+    };
+  }
+  
+  logDebug('Risultato parsing locale:', { action, parameters });
+  return { action, parameters };
 }
 
 // Funzione per eseguire azioni sul calendario
@@ -141,27 +274,32 @@ async function executeCalendarAction(parsedCommand, calendar) {
     case 'DELETE_EVENT':
       return await deleteEvent(calendar, parameters);
     default:
-      return { message: 'Azione non supportata', details: action };
+      return { 
+        success: false,
+        message: 'Azione non supportata', 
+        details: action 
+      };
   }
 }
 
 // Funzioni per operazioni sul calendario
 async function createEvent(calendar, params) {
   const event = {
-    summary: params.title,
+    summary: params.title || 'Nuovo evento',
     description: params.description || '',
     start: {
-      dateTime: params.startDateTime,
+      dateTime: params.startDateTime || new Date().toISOString(),
       timeZone: 'Europe/Rome',
     },
     end: {
-      dateTime: params.endDateTime,
+      dateTime: params.endDateTime || new Date(new Date().getTime() + 3600000).toISOString(),
       timeZone: 'Europe/Rome',
     },
     attendees: params.attendees ? params.attendees.map(email => ({ email })) : [],
   };
 
   try {
+    logDebug('Creazione evento:', event);
     const response = await calendar.events.insert({
       calendarId: 'primary',
       resource: event,
@@ -174,8 +312,8 @@ async function createEvent(calendar, params) {
       eventLink: response.data.htmlLink
     };
   } catch (error) {
-    console.error('Errore nella creazione dell\'evento:', error);
-    throw new Error('Impossibile creare l\'evento');
+    logError('Errore nella creazione dell\'evento:', error);
+    throw new Error('Impossibile creare l\'evento: ' + error.message);
   }
 }
 
@@ -186,6 +324,7 @@ async function updateEvent(calendar, params) {
     
     if (!eventId && params.title) {
       // Cerca per titolo se non abbiamo l'ID
+      logDebug('Ricerca evento per titolo:', params.title);
       const searchResponse = await calendar.events.list({
         calendarId: 'primary',
         q: params.title,
@@ -197,6 +336,7 @@ async function updateEvent(calendar, params) {
       
       if (searchResponse.data.items.length > 0) {
         eventId = searchResponse.data.items[0].id;
+        logDebug('Evento trovato con ID:', eventId);
       } else {
         throw new Error('Evento non trovato');
       }
@@ -237,6 +377,7 @@ async function updateEvent(calendar, params) {
       updatedEvent.attendees = params.attendees.map(email => ({ email }));
     }
     
+    logDebug('Aggiornamento evento:', updatedEvent);
     const response = await calendar.events.update({
       calendarId: 'primary',
       eventId: eventId,
@@ -250,7 +391,7 @@ async function updateEvent(calendar, params) {
       eventLink: response.data.htmlLink
     };
   } catch (error) {
-    console.error('Errore nell\'aggiornamento dell\'evento:', error);
+    logError('Errore nell\'aggiornamento dell\'evento:', error);
     throw new Error(`Impossibile aggiornare l'evento: ${error.message}`);
   }
 }
@@ -265,6 +406,7 @@ async function listEvents(calendar, params) {
       ? new Date(params.endDate).toISOString() 
       : new Date(new Date().setDate(new Date().getDate() + 7)).toISOString();
     
+    logDebug('Ricerca eventi dal', timeMin, 'al', timeMax);
     const response = await calendar.events.list({
       calendarId: 'primary',
       timeMin: timeMin,
@@ -288,7 +430,7 @@ async function listEvents(calendar, params) {
     const formattedEvents = events.map(event => {
       return {
         id: event.id,
-        title: event.summary,
+        title: event.summary || 'Evento senza titolo',
         description: event.description || '',
         start: event.start.dateTime || event.start.date,
         end: event.end.dateTime || event.end.date,
@@ -297,14 +439,15 @@ async function listEvents(calendar, params) {
       };
     });
     
+    logDebug('Eventi trovati:', formattedEvents.length);
     return {
       success: true,
       message: `Trovati ${events.length} eventi`,
       events: formattedEvents
     };
   } catch (error) {
-    console.error('Errore nel recupero degli eventi:', error);
-    throw new Error('Impossibile recuperare gli eventi');
+    logError('Errore nel recupero degli eventi:', error);
+    throw new Error('Impossibile recuperare gli eventi: ' + error.message);
   }
 }
 
@@ -314,6 +457,7 @@ async function deleteEvent(calendar, params) {
     
     if (!eventId && params.title) {
       // Cerca per titolo se non abbiamo l'ID
+      logDebug('Ricerca evento da eliminare con titolo:', params.title);
       const searchResponse = await calendar.events.list({
         calendarId: 'primary',
         q: params.title,
@@ -325,11 +469,13 @@ async function deleteEvent(calendar, params) {
       
       if (searchResponse.data.items.length > 0) {
         eventId = searchResponse.data.items[0].id;
+        logDebug('Evento trovato con ID:', eventId);
       } else {
         throw new Error('Evento non trovato');
       }
     }
     
+    logDebug('Eliminazione evento con ID:', eventId);
     await calendar.events.delete({
       calendarId: 'primary',
       eventId: eventId,
@@ -340,7 +486,7 @@ async function deleteEvent(calendar, params) {
       message: 'Evento eliminato con successo'
     };
   } catch (error) {
-    console.error('Errore nell\'eliminazione dell\'evento:', error);
+    logError('Errore nell\'eliminazione dell\'evento:', error);
     throw new Error(`Impossibile eliminare l'evento: ${error.message}`);
   }
 }
@@ -348,4 +494,6 @@ async function deleteEvent(calendar, params) {
 // Avvio server
 app.listen(PORT, () => {
   console.log(`Server in esecuzione sulla porta ${PORT}`);
+  logDebug('Ambiente:', process.env.NODE_ENV || 'development');
+  logDebug('API Gemini configurata');
 });
