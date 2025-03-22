@@ -95,26 +95,28 @@ async function processWithGemini(command, calendarClient) {
     Rispondi in formato JSON con i campi "action" e "parameters".`;
 
     // Chiamata a Gemini API
-    const response = await axios.post(
-      'https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent',
-      {
-        contents: [
-          { role: 'system', parts: [{ text: systemPrompt }] },
-          { role: 'user', parts: [{ text: command }] }
-        ],
-        generationConfig: {
-          temperature: 0.2
-        }
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': process.env.GEMINI_API_KEY
-        }
-      }
-    );
+const response = await axios.post(
+  'https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent',
+  {
+    contents: [{
+      parts: [
+        { text: systemPrompt },
+        { text: command }
+      ]
+    }],
+    generationConfig: {
+      temperature: 0.2
+    }
+  },
+  {
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': process.env.GEMINI_API_KEY
+    }
+  }
+);
 
-    const geminiResult = response.data.candidates[0].content.parts[0].text;
+const geminiResult = response.data.candidates[0].content.parts[0].text;
     const parsedResult = JSON.parse(geminiResult);
     
     // Esegui l'azione appropriata sul calendario in base all'interpretazione di Gemini
