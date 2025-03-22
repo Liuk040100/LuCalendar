@@ -27,16 +27,33 @@ function App() {
         setIsAuthenticated(true);
         setLoading(false);
       } else if (authStatus === 'success') {
-        // L'utente ha appena completato il flusso di autenticazione
-        // In una app reale, dovresti ottenere il token dal server
-        // Per semplicità, utilizziamo un token fittizio per questo prototipo
-        const tempToken = 'auth-success-token'; // Questo sarebbe ottenuto dal backend
-        setAccessToken(tempToken);
-        setIsAuthenticated(true);
-        sessionStorage.setItem('accessToken', tempToken);
+        // Controlla se è possibile ottenere il token dal server
+        const fetchToken = async () => {
+          try {
+            setLoading(true);
+            const response = await fetch('/api/auth/token');
+            
+            if (response.ok) {
+              const data = await response.json();
+              setAccessToken(data.accessToken);
+              setIsAuthenticated(true);
+              sessionStorage.setItem('accessToken', data.accessToken);
+            } else {
+              // Se non c'è token, ridireziona alla pagina di login
+              setIsAuthenticated(false);
+              setError('Sessione non valida. Effettua nuovamente il login.');
+            }
+          } catch (error) {
+            setIsAuthenticated(false);
+            setError('Errore di autenticazione. Riprova.');
+          } finally {
+            setLoading(false);
+            // Pulisci l'URL
+            window.history.replaceState({}, document.title, window.location.pathname);
+          }
+        };
         
-        // Rimuovi i parametri dalla URL per pulizia
-        window.history.replaceState({}, document.title, window.location.pathname);
+        fetchToken();
       } else {
         setLoading(false);
       }

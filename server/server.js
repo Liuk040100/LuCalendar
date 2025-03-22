@@ -7,6 +7,12 @@ const { google } = require('googleapis');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Configurazione modalità sviluppo
+const DEV_MODE = process.env.NODE_ENV === 'development';
+
+// Struttura per memorizzare temporaneamente i token
+let userTokens = {};
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -28,6 +34,27 @@ const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_SECRET,
   process.env.REDIRECT_URI
 );
+
+// Funzione per assicurare che il token sia valido
+async function ensureValidToken() {
+  if (userTokens.access_token) {
+    const expiryDate = userTokens.expiry_date;
+    const now = new Date().getTime();
+    
+    if (!expiryDate || expiryDate - now < 300000) {
+      try {
+        logDebug('Token in scadenza, tentativo di refresh');
+        oauth2Client.setCredentials(userTokens);
+        const { credentials } = await oauth2Client.refreshToken(userTokens.refresh_token);
+        userTokens = credentials;
+        oauth2Client.setCredentials(credentials);
+      } catch (error) {
+        logError('Errore nel refresh del token:', error);
+        throw new Error('Sessione scaduta, effettua nuovamente il login');
+      }
+    }
+  }
+}
 
 // Endpoint per generare l'URL di autenticazione
 app.get('/api/auth/url', (req, res) => {
@@ -51,16 +78,57 @@ app.get('/api/auth/callback', async (req, res) => {
   
   try {
     const { tokens } = await oauth2Client.getToken(code);
+    // Salva i token per uso futuro
+    userTokens = tokens;
     oauth2Client.setCredentials(tokens);
-    
-    // In un'app reale, dovresti salvare i token in un database
-    // e associarli all'utente corrente
     
     // Redirect al frontend
     res.redirect(`${process.env.CLIENT_URL}?auth=success`);
   } catch (error) {
     logError('Errore di autenticazione:', error);
     res.redirect(`${process.env.CLIENT_URL}?auth=error`);
+  }
+});
+
+// Endpoint per recuperare il token
+app.get('/api/auth/token', (req, res) => {
+  if (userTokens.access_token) {
+    res.json({ 
+      accessToken: userTokens.access_token,
+      expiryDate: userTokens.expiry_date 
+    });
+  } else if (DEV_MODE) {
+    // Solo in sviluppo: crea un token di prova che funziona davvero
+    console.log('[DEV] Generando un token di sviluppo temporaneo');
+    
+    const auth = new google.auth.GoogleAuth({
+      keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+      scopes: [
+        'https://www.googleapis.com/auth/calendar',
+        'https://www.googleapis.com/auth/calendar.events'
+      ]
+    });
+    
+    auth.getClient().then(client => {
+      client.getAccessToken().then(token => {
+        userTokens.access_token = token.token;
+        userTokens.expiry_date = new Date().getTime() + 3600000; // 1 ora
+        
+        res.json({
+          accessToken: userTokens.access_token,
+          expiryDate: userTokens.expiry_date,
+          dev: true
+        });
+      }).catch(err => {
+        console.error('[DEV] Errore nel generare token:', err);
+        res.status(401).json({ error: 'Nessun token disponibile' });
+      });
+    }).catch(err => {
+      console.error('[DEV] Errore nel creare client:', err);
+      res.status(401).json({ error: 'Nessun token disponibile' });
+    });
+  } else {
+    res.status(401).json({ error: 'Nessun token disponibile' });
   }
 });
 
@@ -73,9 +141,44 @@ app.post('/api/process-command', async (req, res) => {
   }
   
   try {
-    // Configurazione client Calendar con token
-    oauth2Client.setCredentials({ access_token: accessToken });
+    // Log dello stato dei token
+    logDebug('Stato token server:', userTokens.access_token ? 
+      `Presente (scade in ${Math.floor((userTokens.expiry_date - Date.now())/1000/60)} minuti)` : 
+      'Assente');
+    logDebug('Token client:', accessToken ? 'Presente' : 'Assente');
+    
+    // Log specifici per il formato del token client
+    if (accessToken) {
+      logDebug('Token client (primi 10 caratteri):', accessToken.substring(0, 10) + '...');
+      // Verifica se sembra un token JWT (formato tipico)
+      const isJWT = accessToken.split('.').length === 3;
+      logDebug('Il token sembra un JWT?', isJWT ? 'Sì' : 'No');
+    }
+    
+    // Usa prima i token salvati sul server
+    if (userTokens.access_token) {
+      await ensureValidToken();
+      oauth2Client.setCredentials(userTokens);
+    } else if (accessToken) {
+      // Fallback al token dal client con formato corretto
+      oauth2Client.setCredentials({ 
+        access_token: accessToken,
+        token_type: 'Bearer'
+      });
+    } else {
+      throw new Error('Nessun token di accesso disponibile');
+    }
+    
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    
+    // Test di validità dell'autenticazione
+    try {
+      const testCall = await calendar.calendarList.list({ maxResults: 1 });
+      logDebug('Test Calendar API riuscito');
+    } catch (calError) {
+      logError('Test Calendar API fallito:', calError.response?.data || calError.message);
+      throw new Error('Autenticazione Calendar fallita: ' + calError.message);
+    }
 
     // Invia il comando a Gemini per l'interpretazione
     const geminiResponse = await processWithGemini(command, calendar);
@@ -93,7 +196,7 @@ app.post('/api/process-command', async (req, res) => {
 // Funzione per elaborare comandi con Gemini
 async function processWithGemini(command, calendarClient) {
   // Endpoint corretto verificato
-  const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent';
+  const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
   
   // Prompt di sistema per Gemini
   const systemPrompt = `Sei un assistente che aiuta a gestire il calendario Google. 
