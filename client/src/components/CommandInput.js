@@ -146,3 +146,5 @@ function CommandInput({ onSubmit, onLogout }) {
     </Box>
   );
 }
+
+export default CommandInput;
