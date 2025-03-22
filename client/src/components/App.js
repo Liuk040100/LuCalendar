@@ -15,9 +15,14 @@ function App() {
 
   useEffect(() => {
     // Verifica se l'utente è già autenticato
-    const checkAuthStatus = () => {
+    const checkAuthStatus = async () => {
       const params = new URLSearchParams(window.location.search);
       const authStatus = params.get('auth');
+      
+      // Pulisci l'URL per evitare riutilizzi del parametro auth=success
+      if (authStatus) {
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
       
       // Controlla se ci sono token salvati in sessionStorage
       const savedToken = sessionStorage.getItem('accessToken');
@@ -27,33 +32,32 @@ function App() {
         setIsAuthenticated(true);
         setLoading(false);
       } else if (authStatus === 'success') {
-        // Controlla se è possibile ottenere il token dal server
-        const fetchToken = async () => {
-          try {
-            setLoading(true);
-            const response = await fetch('/api/auth/token');
+        // Ottieni il token dal server
+        try {
+          setLoading(true);
+          const response = await fetch('/api/auth/token');
+          
+          if (response.ok) {
+            const data = await response.json();
             
-            if (response.ok) {
-              const data = await response.json();
+            // Verifica che il token sia presente e valido
+            if (data.accessToken && data.accessToken !== 'auth-success-token') {
               setAccessToken(data.accessToken);
               setIsAuthenticated(true);
               sessionStorage.setItem('accessToken', data.accessToken);
             } else {
-              // Se non c'è token, ridireziona alla pagina di login
-              setIsAuthenticated(false);
-              setError('Sessione non valida. Effettua nuovamente il login.');
+              throw new Error('Token non valido ricevuto dal server');
             }
-          } catch (error) {
-            setIsAuthenticated(false);
-            setError('Errore di autenticazione. Riprova.');
-          } finally {
-            setLoading(false);
-            // Pulisci l'URL
-            window.history.replaceState({}, document.title, window.location.pathname);
+          } else {
+            throw new Error('Impossibile ottenere il token');
           }
-        };
-        
-        fetchToken();
+        } catch (error) {
+          console.error('Errore di autenticazione:', error);
+          setIsAuthenticated(false);
+          setError('Errore di autenticazione. Riprova.');
+        } finally {
+          setLoading(false);
+        }
       } else {
         setLoading(false);
       }

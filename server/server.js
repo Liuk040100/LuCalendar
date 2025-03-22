@@ -3,6 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { google } = require('googleapis');
+const session = require('express-session');
+const FileStore = require('session-file-store')(session);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -10,12 +12,24 @@ const PORT = process.env.PORT || 3001;
 // Configurazione modalità sviluppo
 const DEV_MODE = process.env.NODE_ENV === 'development';
 
-// Struttura per memorizzare temporaneamente i token
-let userTokens = {};
-
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// Configurazione delle sessioni
+app.use(session({
+  store: new FileStore({
+    path: './sessions',
+    ttl: 86400 // 24 ore
+  }),
+  secret: process.env.SESSION_SECRET || 'lucalendar-secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { 
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 24 * 60 * 60 * 1000 // 24 ore
+  }
+}));
 
 // Configurazione log per debugging
 const DEBUG = process.env.NODE_ENV !== 'production';
@@ -36,24 +50,26 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // Funzione per assicurare che il token sia valido
-async function ensureValidToken() {
-  if (userTokens.access_token) {
-    const expiryDate = userTokens.expiry_date;
+async function ensureValidToken(req) {
+  if (req.session.tokens && req.session.tokens.access_token) {
+    const expiryDate = req.session.tokens.expiry_date;
     const now = new Date().getTime();
     
     if (!expiryDate || expiryDate - now < 300000) {
       try {
-        logDebug('Token in scadenza, tentativo di refresh');
-        oauth2Client.setCredentials(userTokens);
-        const { credentials } = await oauth2Client.refreshToken(userTokens.refresh_token);
-        userTokens = credentials;
+        console.log('Token in scadenza, tentativo di refresh');
+        oauth2Client.setCredentials(req.session.tokens);
+        const { credentials } = await oauth2Client.refreshToken(req.session.tokens.refresh_token);
+        req.session.tokens = credentials;
         oauth2Client.setCredentials(credentials);
       } catch (error) {
-        logError('Errore nel refresh del token:', error);
+        console.error('Errore nel refresh del token:', error);
         throw new Error('Sessione scaduta, effettua nuovamente il login');
       }
     }
+    return req.session.tokens;
   }
+  throw new Error('Nessun token disponibile');
 }
 
 // Endpoint per generare l'URL di autenticazione
@@ -78,54 +94,26 @@ app.get('/api/auth/callback', async (req, res) => {
   
   try {
     const { tokens } = await oauth2Client.getToken(code);
-    // Salva i token per uso futuro
-    userTokens = tokens;
-    oauth2Client.setCredentials(tokens);
+    
+    // Salva i token nella sessione dell'utente
+    req.session.tokens = tokens;
+    console.log('Token OAuth ottenuti e salvati in sessione:', 
+      tokens.access_token ? 'Token presente' : 'Token mancante');
     
     // Redirect al frontend
     res.redirect(`${process.env.CLIENT_URL}?auth=success`);
   } catch (error) {
-    logError('Errore di autenticazione:', error);
-    res.redirect(`${process.env.CLIENT_URL}?auth=error`);
+    console.error('Errore di autenticazione:', error);
+    res.redirect(`${process.env.CLIENT_URL}?auth=error&message=${encodeURIComponent(error.message)}`);
   }
 });
 
 // Endpoint per recuperare il token
 app.get('/api/auth/token', (req, res) => {
-  if (userTokens.access_token) {
+  if (req.session.tokens && req.session.tokens.access_token) {
     res.json({ 
-      accessToken: userTokens.access_token,
-      expiryDate: userTokens.expiry_date 
-    });
-  } else if (DEV_MODE) {
-    // Solo in sviluppo: crea un token di prova che funziona davvero
-    console.log('[DEV] Generando un token di sviluppo temporaneo');
-    
-    const auth = new google.auth.GoogleAuth({
-      keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-      scopes: [
-        'https://www.googleapis.com/auth/calendar',
-        'https://www.googleapis.com/auth/calendar.events'
-      ]
-    });
-    
-    auth.getClient().then(client => {
-      client.getAccessToken().then(token => {
-        userTokens.access_token = token.token;
-        userTokens.expiry_date = new Date().getTime() + 3600000; // 1 ora
-        
-        res.json({
-          accessToken: userTokens.access_token,
-          expiryDate: userTokens.expiry_date,
-          dev: true
-        });
-      }).catch(err => {
-        console.error('[DEV] Errore nel generare token:', err);
-        res.status(401).json({ error: 'Nessun token disponibile' });
-      });
-    }).catch(err => {
-      console.error('[DEV] Errore nel creare client:', err);
-      res.status(401).json({ error: 'Nessun token disponibile' });
+      accessToken: req.session.tokens.access_token,
+      expiryDate: req.session.tokens.expiry_date 
     });
   } else {
     res.status(401).json({ error: 'Nessun token disponibile' });
@@ -134,58 +122,34 @@ app.get('/api/auth/token', (req, res) => {
 
 // Endpoint per elaborare comandi tramite Gemini
 app.post('/api/process-command', async (req, res) => {
-  const { command, accessToken } = req.body;
+  const { command } = req.body;
   
   if (!command) {
     return res.status(400).json({ error: 'Comando mancante' });
   }
   
   try {
-    // Log dello stato dei token
-    logDebug('Stato token server:', userTokens.access_token ? 
-      `Presente (scade in ${Math.floor((userTokens.expiry_date - Date.now())/1000/60)} minuti)` : 
-      'Assente');
-    logDebug('Token client:', accessToken ? 'Presente' : 'Assente');
-    
-    // Log specifici per il formato del token client
-    if (accessToken) {
-      logDebug('Token client (primi 10 caratteri):', accessToken.substring(0, 10) + '...');
-      // Verifica se sembra un token JWT (formato tipico)
-      const isJWT = accessToken.split('.').length === 3;
-      logDebug('Il token sembra un JWT?', isJWT ? 'Sì' : 'No');
-    }
-    
-    // Usa prima i token salvati sul server
-    if (userTokens.access_token) {
-      await ensureValidToken();
-      oauth2Client.setCredentials(userTokens);
-    } else if (accessToken) {
-      // Fallback al token dal client con formato corretto
-      oauth2Client.setCredentials({ 
-        access_token: accessToken,
-        token_type: 'Bearer'
-      });
-    } else {
-      throw new Error('Nessun token di accesso disponibile');
-    }
+    // Utilizzo dei token dalla sessione utente
+    const tokens = await ensureValidToken(req);
+    oauth2Client.setCredentials(tokens);
     
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
     
     // Test di validità dell'autenticazione
     try {
       const testCall = await calendar.calendarList.list({ maxResults: 1 });
-      logDebug('Test Calendar API riuscito');
+      console.log('Test Calendar API riuscito');
     } catch (calError) {
-      logError('Test Calendar API fallito:', calError.response?.data || calError.message);
+      console.error('Test Calendar API fallito:', calError.response?.data || calError.message);
       throw new Error('Autenticazione Calendar fallita: ' + calError.message);
     }
-
+    
     // Invia il comando a Gemini per l'interpretazione
     const geminiResponse = await processWithGemini(command, calendar);
     
     res.json({ result: geminiResponse });
   } catch (error) {
-    logError('Errore nell\'elaborazione del comando:', error);
+    console.error('Errore nell\'elaborazione del comando:', error);
     res.status(500).json({ 
       error: 'Errore nell\'elaborazione del comando',
       details: error.message 
@@ -200,15 +164,42 @@ async function processWithGemini(command, calendarClient) {
   
   // Prompt di sistema per Gemini
   const systemPrompt = `Sei un assistente che aiuta a gestire il calendario Google. 
-  Interpreta il comando dell'utente per determinare quale operazione eseguire:
-  1. Crea evento
-  2. Modifica evento
-  3. Visualizza eventi
-  4. Elimina evento
-  5. Altro (specificare)
-  
-  Per ogni comando, estrai i dettagli pertinenti come data, ora, titolo, descrizione, partecipanti, ecc.
-  Rispondi in formato JSON con i campi "action" e "parameters".`;
+Interpreta il comando dell'utente per determinare quale operazione eseguire:
+1. Crea evento
+2. Modifica evento
+3. Visualizza eventi
+4. Elimina evento
+
+Per ogni comando, estrai i dettagli pertinenti come data, ora, titolo, descrizione, partecipanti, ecc.
+Rispondi in formato JSON con i campi "action" e "parameters".
+
+Il campo "action" deve essere uno tra:
+- "Crea evento" (per creare un nuovo evento)
+- "Modifica evento" (per modificare un evento esistente)
+- "Visualizza eventi" (per visualizzare eventi esistenti)
+- "Elimina evento" (per eliminare un evento)
+
+Il campo "parameters" deve contenere i seguenti campi (solo quelli pertinenti):
+- "titolo": il nome dell'evento
+- "data": la data dell'evento (oggi, domani, un giorno specifico)
+- "ora_inizio": l'ora di inizio dell'evento in formato HH:MM
+- "ora_fine": l'ora di fine dell'evento in formato HH:MM
+- "descrizione": descrizione dell'evento
+- "partecipanti": elenco dei partecipanti
+
+Esempio:
+Comando: "Crea una riunione con Mario domani alle 15"
+Risposta:
+{
+  "action": "Crea evento",
+  "parameters": {
+    "titolo": "Riunione con Mario",
+    "data": "domani",
+    "ora_inizio": "15:00",
+    "ora_fine": "16:00",
+    "partecipanti": ["mario@example.com"]
+  }
+}`;
 
   try {
     logDebug('Invio richiesta a Gemini API:', GEMINI_ENDPOINT);
@@ -256,8 +247,11 @@ async function processWithGemini(command, calendarClient) {
       const parsedResult = JSON.parse(cleanedResult);
       logDebug('Interpretazione comando:', parsedResult);
       
+      // Normalizza la risposta
+      const normalizedResult = normalizeGeminiResponse(parsedResult);
+      
       // Esegui l'azione appropriata sul calendario
-      return await executeCalendarAction(parsedResult, calendarClient);
+      return await executeCalendarAction(normalizedResult, calendarClient);
     } catch (parseError) {
       logError('Errore nel parsing JSON della risposta:', cleanedResult);
       logError('Dettaglio errore:', parseError);
@@ -363,7 +357,143 @@ function basicCommandParser(command) {
   return { action, parameters };
 }
 
-// Funzione per eseguire azioni sul calendario
+// Funzione per normalizzare la risposta di Gemini
+function normalizeGeminiResponse(parsedResult) {
+  // Copia l'oggetto per non modificare l'originale
+  const result = { ...parsedResult };
+  
+  // Normalizza l'azione
+  const actionMapping = {
+    'crea evento': 'CREATE_EVENT',
+    'crea appuntamento': 'CREATE_EVENT',
+    'nuovo evento': 'CREATE_EVENT',
+    'aggiorna evento': 'UPDATE_EVENT',
+    'modifica evento': 'UPDATE_EVENT',
+    'sposta evento': 'UPDATE_EVENT',
+    'cambia evento': 'UPDATE_EVENT',
+    'visualizza eventi': 'VIEW_EVENTS',
+    'mostra eventi': 'VIEW_EVENTS',
+    'elenca eventi': 'VIEW_EVENTS',
+    'elimina evento': 'DELETE_EVENT',
+    'cancella evento': 'DELETE_EVENT',
+    'rimuovi evento': 'DELETE_EVENT'
+  };
+  
+  // Normalizza azione in minuscolo per il confronto
+  const normalizedAction = result.action.toLowerCase();
+  
+  // Cerca corrispondenze esatte o parziali
+  let standardAction = null;
+  for (const [key, value] of Object.entries(actionMapping)) {
+    if (normalizedAction === key || normalizedAction.includes(key)) {
+      standardAction = value;
+      break;
+    }
+  }
+  
+  // Se non abbiamo trovato una corrispondenza, tenta di semplificare ulteriormente
+  if (!standardAction) {
+    if (normalizedAction.includes('crea')) standardAction = 'CREATE_EVENT';
+    else if (normalizedAction.includes('modifica') || normalizedAction.includes('sposta')) standardAction = 'UPDATE_EVENT';
+    else if (normalizedAction.includes('mostra') || normalizedAction.includes('visualizza')) standardAction = 'VIEW_EVENTS';
+    else if (normalizedAction.includes('elimina') || normalizedAction.includes('cancella')) standardAction = 'DELETE_EVENT';
+    else standardAction = 'VIEW_EVENTS'; // default fallback
+  }
+  
+  // Normalizza i parametri
+  const normalizedParams = {};
+  const params = result.parameters || {};
+  
+  // Mappatura dei nomi dei parametri
+  if (params.titolo) normalizedParams.title = params.titolo;
+  if (params.title) normalizedParams.title = params.title;
+  
+  if (params.descrizione) normalizedParams.description = params.descrizione;
+  if (params.description) normalizedParams.description = params.description;
+  
+  // Gestione data e ora
+  const today = new Date();
+  let eventDate = today;
+  
+  // Interpreta la data se presente
+  if (params.data) {
+    if (params.data.toLowerCase() === 'oggi') {
+      eventDate = today;
+    } else if (params.data.toLowerCase() === 'domani') {
+      eventDate = new Date(today);
+      eventDate.setDate(eventDate.getDate() + 1);
+    } else if (params.data.toLowerCase().includes('prossimo') || params.data.toLowerCase().includes('prossima')) {
+      // Logica per "prossimo lunedì", ecc.
+      const dayMapping = {
+        'lunedì': 1, 'lunedi': 1, 
+        'martedì': 2, 'martedi': 2,
+        'mercoledì': 3, 'mercoledi': 3,
+        'giovedì': 4, 'giovedi': 4,
+        'venerdì': 5, 'venerdi': 5,
+        'sabato': 6, 
+        'domenica': 0
+      };
+      
+      for (const [day, dayNum] of Object.entries(dayMapping)) {
+        if (params.data.toLowerCase().includes(day)) {
+          eventDate = new Date();
+          const currentDay = eventDate.getDay();
+          const daysToAdd = (dayNum + 7 - currentDay) % 7;
+          eventDate.setDate(eventDate.getDate() + (daysToAdd === 0 ? 7 : daysToAdd));
+          break;
+        }
+      }
+    } else {
+      // Tentativo di parsing diretto della data
+      try {
+        const parsedDate = new Date(params.data);
+        if (!isNaN(parsedDate.getTime())) {
+          eventDate = parsedDate;
+        }
+      } catch (e) {
+        console.log('Errore parsing data:', e);
+      }
+    }
+  }
+  
+  // Gestione ora inizio
+  if (params.ora_inizio) {
+    const [hours, minutes] = params.ora_inizio.split(':').map(Number);
+    eventDate.setHours(hours || 0, minutes || 0, 0);
+    normalizedParams.startDateTime = eventDate.toISOString();
+    
+    // Se c'è ora_fine, la imposta
+    if (params.ora_fine) {
+      const endDate = new Date(eventDate);
+      const [endHours, endMinutes] = params.ora_fine.split(':').map(Number);
+      endDate.setHours(endHours || 0, endMinutes || 0, 0);
+      normalizedParams.endDateTime = endDate.toISOString();
+    } else {
+      // Altrimenti imposta la fine a un'ora dopo l'inizio
+      const endDate = new Date(eventDate);
+      endDate.setHours(endDate.getHours() + 1);
+      normalizedParams.endDateTime = endDate.toISOString();
+    }
+  }
+  
+  // Partecipanti
+  if (params.partecipanti) {
+    normalizedParams.attendees = Array.isArray(params.partecipanti) 
+      ? params.partecipanti 
+      : [params.partecipanti];
+  }
+  
+  logDebug('Normalizzazione risposta Gemini:');
+  logDebug('  Azione originale:', result.action, '→', standardAction);
+  logDebug('  Parametri normalizzati:', normalizedParams);
+  
+  return {
+    action: standardAction,
+    parameters: normalizedParams
+  };
+}
+
+// Funzione per elaborare azioni sul calendario
 async function executeCalendarAction(parsedCommand, calendar) {
   const { action, parameters } = parsedCommand;
   
