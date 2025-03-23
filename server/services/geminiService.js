@@ -12,28 +12,25 @@ const logger = createLogger('gemini-service');
  */
 const SYSTEM_PROMPT = `Sei un assistente che aiuta a gestire il calendario Google. 
 Interpreta il comando dell'utente per determinare quale operazione eseguire:
-1. Crea evento
-2. Modifica evento
-3. Visualizza eventi
-4. Elimina evento
 
-Per ogni comando, estrai i dettagli pertinenti come data, ora, titolo, descrizione, partecipanti, ecc.
-Rispondi in formato JSON con i campi "action" e "parameters".
+La tua risposta DEVE essere in formato JSON con questa ESATTA struttura:
+{
+  "action": "[AZIONE]",
+  "parameters": {
+    "title": "Titolo evento",
+    "date": "Data evento",
+    "startTime": "Ora inizio",
+    "endTime": "Ora fine",
+    "description": "Descrizione",
+    "attendees": ["nome1", "nome2"]
+  }
+}
 
-Il campo "action" deve essere uno tra:
+Dove [AZIONE] deve essere uno di questi valori esatti:
 - "CREATE_EVENT" (per creare un nuovo evento)
 - "UPDATE_EVENT" (per modificare un evento esistente)
 - "VIEW_EVENTS" (per visualizzare eventi esistenti)
 - "DELETE_EVENT" (per eliminare un evento)
-
-Il campo "parameters" deve contenere i seguenti campi (solo quelli pertinenti):
-- "title": il nome dell'evento
-- "date": la data dell'evento (oggi, domani, un giorno specifico)
-- "startTime": l'ora di inizio dell'evento in formato HH:MM
-- "endTime": l'ora di fine dell'evento in formato HH:MM
-- "description": descrizione dell'evento
-- "attendees": elenco dei partecipanti
-- "query": termine di ricerca per trovare eventi esistenti
 
 Esempio:
 Comando: "Crea una riunione con Mario domani alle 15"
@@ -45,7 +42,7 @@ Risposta:
     "date": "domani",
     "startTime": "15:00",
     "endTime": "16:00",
-    "attendees": ["mario@example.com"]
+    "attendees": ["Mario"]
   }
 }`;
 
@@ -58,32 +55,57 @@ const processCommand = async (command) => {
   logger.debug('Elaborazione comando:', command);
   
   try {
+    // Log configurazione API
+    logger.debug('Configurazione API Gemini:', { 
+      apiKeyConfigured: !!process.env.GEMINI_API_KEY,
+      apiKeyLength: process.env.GEMINI_API_KEY ? process.env.GEMINI_API_KEY.length : 0
+    });
+    
     logger.debug('Invio richiesta a Gemini API');
+    const requestPayload = {
+      contents: [{
+        parts: [
+          { text: SYSTEM_PROMPT },
+          { text: command }
+        ]
+      }],
+      generationConfig: {
+        temperature: 0.2,
+        maxOutputTokens: 1024,
+        topP: 0.8
+      }
+    };
+    
+    // Log della richiesta (senza la chiave API)
+    logger.debug('Payload richiesta Gemini:', JSON.stringify(requestPayload));
+    
     const response = await axios.post(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
-      {
-        contents: [{
-          parts: [
-            { text: SYSTEM_PROMPT },
-            { text: command }
-          ]
-        }],
-        generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 1024,
-          topP: 0.8
-        }
-      },
+      requestPayload,
       {
         headers: {
           'Content-Type': 'application/json',
           'x-goog-api-key': process.env.GEMINI_API_KEY
-        }
+        },
+        timeout: 10000 // Aggiunto timeout di 10 secondi
       }
     );
 
-    logger.debug('Risposta ricevuta da Gemini API');
-    logger.debug('Risposta completa Gemini:', JSON.stringify(response.data));
+    logger.debug('Risposta ricevuta da Gemini API con status:', response.status);
+    
+    // Verifica della struttura della risposta
+    if (!response.data) {
+      throw new Error('Risposta Gemini vuota');
+    }
+    
+    // Log strutturato della risposta
+    logger.debug('Struttura risposta Gemini', {
+      hasData: !!response.data,
+      hasCandidates: !!response.data.candidates,
+      candidatesLength: response.data.candidates ? response.data.candidates.length : 0,
+      firstCandidateHasContent: response.data.candidates && response.data.candidates[0] ? 
+                               !!response.data.candidates[0].content : false
+    });
     
     if (!response.data.candidates || 
         !response.data.candidates[0] || 
@@ -94,21 +116,31 @@ const processCommand = async (command) => {
     }
     
     const geminiResult = response.data.candidates[0].content.parts[0].text;
-    return parseGeminiResponse(geminiResult);
+    logger.debug('Testo risposta Gemini:', geminiResult);
+    
+    // Tentativo di parsing
+    try {
+      return parseGeminiResponse(geminiResult);
+    } catch (parseError) {
+      logger.error('Errore nel parsing della risposta Gemini:', parseError);
+      logger.debug('Utilizzo parser locale di fallback dopo errore parsing');
+      return parseCommandLocally(command);
+    }
   } catch (error) {
     logger.error('Errore nella comunicazione con Gemini:', error.message);
     
     if (error.response) {
       logger.error('Dettagli errore API:', {
         status: error.response.status,
+        statusText: error.response.statusText,
         data: error.response.data
       });
     } else if (error.request) {
-      logger.error('Nessuna risposta ricevuta');
+      logger.error('Nessuna risposta ricevuta, possibile timeout');
     }
     
-    // Fallback a un parser locale
-    logger.debug('Utilizzo parser locale di fallback');
+    // Fallback a un parser locale con log specifico
+    logger.debug('Utilizzo parser locale di fallback dopo errore comunicazione');
     return parseCommandLocally(command);
   }
 };
@@ -120,36 +152,24 @@ const processCommand = async (command) => {
  */
 const parseGeminiResponse = (responseText) => {
   try {
-    // Estrai il JSON dalla risposta
-    let jsonText = responseText;
+    logger.debug('Inizio parsing risposta Gemini:', responseText.substring(0, 200) + '...');
     
-    // Rimuovi qualsiasi testo prima del primo '{'
-    const jsonStartIndex = jsonText.indexOf('{');
-    if (jsonStartIndex >= 0) {
-      jsonText = jsonText.substring(jsonStartIndex);
-    } else {
-      throw new Error('Nessun oggetto JSON trovato nella risposta');
-    }
+    // Estrai il JSON dalla risposta (rimuovi backticks e tag json)
+    let jsonText = responseText.replace(/```json|```/g, '').trim();
     
-    // Rimuovi qualsiasi testo dopo l'ultimo '}'
-    const jsonEndIndex = jsonText.lastIndexOf('}');
-    if (jsonEndIndex >= 0) {
-      jsonText = jsonText.substring(0, jsonEndIndex + 1);
-    } else {
-      throw new Error('JSON non terminato correttamente');
-    }
+    // Sanitizza il JSON prima del parsing
+    // Corregge problemi come "15":00" -> "15:00"
+    jsonText = jsonText.replace(/"(\d{1,2})":(\d{2})"/g, '"$1:$2"');
     
-    // Pulisci il testo per il parsing
-    jsonText = jsonText.replace(/\\n/g, ' ').replace(/\\"/g, '"');
+    logger.debug('JSON sanitizzato:', jsonText);
     
     // Parsing del JSON
-    logger.debug('Tentativo di parsing JSON:', jsonText);
     const parsedResult = JSON.parse(jsonText);
+    logger.debug('Parsing JSON completato con successo');
     
-    // Verifica e normalizza il risultato
     return normalizeResponse(parsedResult);
   } catch (error) {
-    logger.error('Errore nel parsing JSON della risposta:', error);
+    logger.error('Errore nel parsing della risposta:', error);
     throw error;
   }
 };
@@ -160,6 +180,34 @@ const parseGeminiResponse = (responseText) => {
  * @returns {Object} Risultato normalizzato
  */
 const normalizeResponse = (parsedResult) => {
+  // Gestione struttura piatta vs nidificata
+  if (!parsedResult.action && parsedResult.azione) {
+    // Caso in cui abbiamo una risposta nel formato italiano non nidificato
+    logger.debug('Normalizzazione risposta da formato italiano piatto');
+    
+    // Mappa dei campi da italiano a inglese
+    const actionMapping = {
+      'crea_evento': 'CREATE_EVENT',
+      'modifica_evento': 'UPDATE_EVENT',
+      'visualizza_eventi': 'VIEW_EVENTS',
+      'elimina_evento': 'DELETE_EVENT',
+    };
+    
+    // Crea la struttura attesa
+    return {
+      action: actionMapping[parsedResult.azione.toLowerCase()] || 'CREATE_EVENT',
+      parameters: {
+        title: parsedResult.riepilogo || parsedResult.titolo,
+        description: parsedResult.descrizione,
+        date: parsedResult.data,
+        startTime: parsedResult.ora_inizio,
+        endTime: parsedResult.ora_fine,
+        attendees: parsedResult.partecipanti || []
+      }
+    };
+  }
+
+  // Codice originale per formati già corretti
   if (!parsedResult.action) {
     throw new Error('Campo "action" mancante nella risposta');
   }
@@ -243,61 +291,63 @@ const parseCommandLocally = (command) => {
   let action = null;
   const parameters = {};
   
-  // Estrai il titolo
-  const titleMatch = command.match(/chiamat[oa]\s+([^,\.]+)/i) || 
-                     command.match(/intitolat[oa]\s+([^,\.]+)/i) ||
-                     command.match(/\b(evento|riunione|appuntamento)\s+([^,\.]+)/i) ||
-                     command.match(/(?:sposta|modifica|elimina|cancella)\s+(?:l[''])?(?:evento|appuntamento|riunione)?\s*(?:chiamato)?\s*["']?([^,\.\s"']+)["']?/i);
-  
-  if (titleMatch) {
-    parameters.title = (titleMatch[1] || titleMatch[2]).trim();
-  }
-  
-  // Estrai orario
-  const timeMatch = command.match(/(\d{1,2})[:\.](\d{2})/);
-  if (timeMatch) {
-    parameters.startTime = `${timeMatch[1]}:${timeMatch[2]}`;
-    
-    // Aggiungi anche un'ora di fine predefinita (+1 ora)
-    const hour = parseInt(timeMatch[1]);
-    parameters.endTime = `${hour + 1}:${timeMatch[2]}`;
-  }
-  
-  // Estrai data
-  if (lowerCommand.includes('oggi')) {
-    parameters.date = 'oggi';
-  } else if (lowerCommand.includes('domani')) {
-    parameters.date = 'domani';
-  } else if (lowerCommand.includes('prossim')) {
-    // Prova a estrarre il giorno della settimana
-    const days = ['lunedì', 'martedì', 'mercoledì', 'giovedì', 'venerdì', 'sabato', 'domenica'];
-    for (const day of days) {
-      if (lowerCommand.includes(day)) {
-        parameters.date = `prossimo ${day}`;
-        break;
+  try {
+    // Estrazione più accurata del titolo
+    if (lowerCommand.includes('riunione con') || lowerCommand.includes('appuntamento con')) {
+      const match = command.match(/(?:riunione|appuntamento) con ([^\d]+)/i);
+      if (match && match[1]) {
+        parameters.title = `Riunione con ${match[1].trim()}`;
+        // Estrai solo il nome della persona come partecipante
+        parameters.attendees = [match[1].trim()]; 
+        logger.debug('Titolo estratto:', parameters.title);
+        logger.debug('Partecipante estratto:', parameters.attendees[0]);
       }
+    } else {
+      parameters.title = 'Nuovo evento';
     }
+    
+    // Estrai orario (resta invariato)
+    const timeMatch = command.match(/(\d{1,2})[:\.]?(\d{2})?\s*$/);
+    if (timeMatch) {
+      const hours = parseInt(timeMatch[1]);
+      const minutes = timeMatch[2] ? parseInt(timeMatch[2]) : 0;
+      parameters.startTime = `${hours}:${minutes || '00'}`;
+      parameters.endTime = `${(hours + 1) % 24}:${minutes || '00'}`;
+      logger.debug('Orario inizio estratto:', parameters.startTime);
+    }
+    
+    // Estrazione della data
+    if (lowerCommand.includes('oggi')) {
+      parameters.date = 'oggi';
+    } else if (lowerCommand.includes('domani')) {
+      parameters.date = 'domani';
+    }
+    
+    // Determina l'azione
+    if (lowerCommand.includes('crea')) {
+      action = 'CREATE_EVENT';
+    } else if (lowerCommand.includes('mostra')) {
+      action = 'VIEW_EVENTS';
+    } else if (lowerCommand.includes('modifica')) {
+      action = 'UPDATE_EVENT';
+    } else if (lowerCommand.includes('elimina')) {
+      action = 'DELETE_EVENT';
+    } else {
+      action = 'CREATE_EVENT'; // Default
+    }
+    
+    logger.debug('Azione determinata dal parser locale:', action);
+    logger.debug('Parametri estratti dal parser locale:', parameters);
+    
+    return { action, parameters };
+  } catch (error) {
+    logger.error('Errore nel parser locale:', error);
+    // Fallback sicuro
+    return {
+      action: 'VIEW_EVENTS',
+      parameters: { maxResults: 5 }
+    };
   }
-  
-  // Determina l'azione
-  if (lowerCommand.includes('crea') || lowerCommand.includes('nuovo') || 
-      lowerCommand.includes('aggiungi') || lowerCommand.includes('fissa')) {
-    action = 'CREATE_EVENT';
-  } else if (lowerCommand.includes('mostra') || lowerCommand.includes('visualizza') || 
-             lowerCommand.includes('elenco') || lowerCommand.includes('vedi')) {
-    action = 'VIEW_EVENTS';
-  } else if (lowerCommand.includes('modifica') || lowerCommand.includes('sposta') || 
-             lowerCommand.includes('cambia') || lowerCommand.includes('aggiorna')) {
-    action = 'UPDATE_EVENT';
-  } else if (lowerCommand.includes('elimina') || lowerCommand.includes('cancella') || 
-             lowerCommand.includes('rimuovi')) {
-    action = 'DELETE_EVENT';
-  } else {
-    // Default
-    action = 'VIEW_EVENTS';
-  }
-  
-  return { action, parameters };
 };
 
 module.exports = {
