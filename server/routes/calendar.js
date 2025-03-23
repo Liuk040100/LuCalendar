@@ -23,18 +23,26 @@ router.post('/process-command', requireAuth, async (req, res) => {
   }
   
   try {
+    // Aggiungi log per verificare l'input
     logger.info('Elaborazione comando:', command);
+    logger.debug('Token disponibile:', !!req.oauth2Client);
     
     // Utilizza Gemini per interpretare il comando
+    logger.debug('Inizio interpretazione comando con Gemini');
     const parsedCommand = await geminiService.processCommand(command);
     logger.debug('Comando interpretato:', parsedCommand);
     
     // Esegui l'azione appropriata
+    logger.debug('Esecuzione azione sul calendario:', parsedCommand.action);
     const result = await executeCalendarAction(parsedCommand, req.oauth2Client);
     
+    logger.debug('Risultato operazione:', result);
     res.json({ result });
   } catch (error) {
+    // Log dettagliato dell'errore
     logger.error('Errore nell\'elaborazione del comando:', error);
+    logger.error('Stack trace:', error.stack);
+    
     res.status(500).json({ 
       error: 'Errore nell\'elaborazione del comando',
       details: error.message 

@@ -58,6 +58,7 @@ const processCommand = async (command) => {
   logger.debug('Elaborazione comando:', command);
   
   try {
+    logger.debug('Invio richiesta a Gemini API');
     const response = await axios.post(
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent',
       {
@@ -82,6 +83,7 @@ const processCommand = async (command) => {
     );
 
     logger.debug('Risposta ricevuta da Gemini API');
+    logger.debug('Risposta completa Gemini:', JSON.stringify(response.data));
     
     if (!response.data.candidates || 
         !response.data.candidates[0] || 
@@ -94,14 +96,15 @@ const processCommand = async (command) => {
     const geminiResult = response.data.candidates[0].content.parts[0].text;
     return parseGeminiResponse(geminiResult);
   } catch (error) {
-    logger.error('Errore nella comunicazione con Gemini:', error);
+    logger.error('Errore nella comunicazione con Gemini:', error.message);
     
     if (error.response) {
-      logger.error('Dettagli risposta errore:', {
+      logger.error('Dettagli errore API:', {
         status: error.response.status,
-        statusText: error.response.statusText,
         data: error.response.data
       });
+    } else if (error.request) {
+      logger.error('Nessuna risposta ricevuta');
     }
     
     // Fallback a un parser locale
