@@ -39,3 +39,18 @@ yarn-error.log*
 # OS files
 .DS_Store
 Thumbs.db
+
+# File di sessione
+/server/sessions/
+sessions/
+
+# Log
+*.log
+npm-debug.log*
+
+# Coverage
+/coverage
+
+# Build e distribuzione
+/build
+/dist

@@ -42,6 +42,14 @@ function logError(...args) {
   console.error('[ERROR]', ...args);
 }
 
+// Funzione migliorata per logging di oggetti
+function debugObject(label, obj) {
+  if (DEBUG) {
+    console.log(`[DEBUG] ${label}:`);
+    console.log(JSON.stringify(obj, null, 2));
+  }
+}
+
 // Google OAuth setup
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -58,14 +66,43 @@ async function ensureValidToken(req) {
     if (!expiryDate || expiryDate - now < 300000) {
       try {
         console.log('Token in scadenza, tentativo di refresh');
+        
+        // Verifica che il refresh_token esista
+        if (!req.session.tokens.refresh_token) {
+          req.session.tokens = null; // Pulisci token non validi
+          throw new Error('Refresh token mancante, richiesta riautenticazione');
+        }
+        
         oauth2Client.setCredentials(req.session.tokens);
-        const { credentials } = await oauth2Client.refreshToken(req.session.tokens.refresh_token);
-        req.session.tokens = credentials;
-        oauth2Client.setCredentials(credentials);
+        const result = await oauth2Client.refreshToken(req.session.tokens.refresh_token);
+        
+        // Verifica che result.credentials contenga i dati necessari
+        if (!result || !result.credentials || !result.credentials.access_token) {
+          req.session.tokens = null;
+          throw new Error('Token refresh non riuscito');
+        }
+        
+        req.session.tokens = result.credentials;
+        
+        // Salva immediatamente le modifiche alla sessione
+        await new Promise((resolve, reject) => {
+          req.session.save(err => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+        
+        oauth2Client.setCredentials(req.session.tokens);
+        console.log('Token refreshed successfully');
       } catch (error) {
-        console.error('Errore nel refresh del token:', error);
+        console.error('Errore nel refresh del token:', error.message);
+        // Resetta i token in sessione per forzare un nuovo login
+        req.session.tokens = null;
         throw new Error('Sessione scaduta, effettua nuovamente il login');
       }
+    } else {
+      // Il token è ancora valido, imposta le credenziali
+      oauth2Client.setCredentials(req.session.tokens);
     }
     return req.session.tokens;
   }
@@ -243,8 +280,23 @@ Risposta:
     const cleanedResult = geminiResult.replace(/```json/g, '').replace(/```/g, '').trim();
     
     try {
-      // Parsing della risposta JSON
-      const parsedResult = JSON.parse(cleanedResult);
+      // Prima rimuovi eventuali prefissi o testo non JSON
+      let cleanedResult2 = geminiResult;
+      
+      // Se inizia con "Comando:" o altre stringhe note
+      const jsonStartIndex = cleanedResult2.indexOf('{');
+      if (jsonStartIndex > 0) {
+        cleanedResult2 = cleanedResult2.substring(jsonStartIndex);
+      }
+      
+      // Rimuovi eventuali suffissi
+      const jsonEndIndex = cleanedResult2.lastIndexOf('}');
+      if (jsonEndIndex > 0 && jsonEndIndex < cleanedResult2.length - 1) {
+        cleanedResult2 = cleanedResult2.substring(0, jsonEndIndex + 1);
+      }
+      
+      // Ora prova a fare il parsing
+      const parsedResult = JSON.parse(cleanedResult2);
       logDebug('Interpretazione comando:', parsedResult);
       
       // Normalizza la risposta
@@ -279,19 +331,22 @@ Risposta:
   }
 }
 
-// Parser locale di base come fallback
+// Parser locale di base come fallback - MIGLIORATO
 function basicCommandParser(command) {
   logDebug('Parsing locale del comando:', command);
   const lowerCommand = command.toLowerCase();
   let action = null;
   let parameters = {};
   
-  // Estrazione del titolo
+  // Estrazione del titolo - MIGLIORATA
   const titleMatch = command.match(/chiamat[oa]\s+([^,\.]+)/i) || 
                      command.match(/intitolat[oa]\s+([^,\.]+)/i) ||
-                     command.match(/\b(evento|riunione|appuntamento)\s+([^,\.]+)/i);
+                     command.match(/\b(evento|riunione|appuntamento)\s+([^,\.]+)/i) ||
+                     // Pattern specifici per comandi di modifica/eliminazione
+                     command.match(/(?:sposta|modifica|elimina|cancella)\s+(?:l[''])?(?:evento|appuntamento|riunione)?\s*(?:chiamato)?\s*["']?([^,\.\s"']+)["']?/i);
   
   const title = titleMatch ? (titleMatch[1] || titleMatch[2]).trim() : 'Nuovo evento';
+  logDebug('Titolo estratto dal comando:', title);
   
   // Estrazione base della data e ora
   const timeMatch = command.match(/(\d{1,2})[:\.](\d{2})/);
@@ -353,7 +408,7 @@ function basicCommandParser(command) {
     };
   }
   
-  logDebug('Risultato parsing locale:', { action, parameters });
+  debugObject('Risultato parsing locale', { action, parameters });
   return { action, parameters };
 }
 
@@ -398,6 +453,21 @@ function normalizeGeminiResponse(parsedResult) {
     else if (normalizedAction.includes('mostra') || normalizedAction.includes('visualizza')) standardAction = 'VIEW_EVENTS';
     else if (normalizedAction.includes('elimina') || normalizedAction.includes('cancella')) standardAction = 'DELETE_EVENT';
     else standardAction = 'VIEW_EVENTS'; // default fallback
+  }
+  
+  // Gestione comandi speciali (batch)
+  if (normalizedAction === 'DELETE_EVENT' && 
+      (result.parameters?.titolo?.toLowerCase().includes('tutti') || 
+       result.parameters?.title?.toLowerCase().includes('tutti'))) {
+    
+    standardAction = 'DELETE_ALL_EVENTS';
+    // Non serve titolo per questa operazione
+    delete normalizedParams.title;
+    
+    // Se c'è data, la manteniamo
+    if (result.parameters.data) {
+      // Mantieni i parametri della data
+    }
   }
   
   // Normalizza i parametri
@@ -476,6 +546,11 @@ function normalizeGeminiResponse(parsedResult) {
     }
   }
   
+  // Passaggio diretto dei parametri per aggiornamenti
+  normalizedParams.ora_inizio = params.ora_inizio;
+  normalizedParams.ora_fine = params.ora_fine;
+  normalizedParams.data = params.data;
+  
   // Partecipanti
   if (params.partecipanti) {
     normalizedParams.attendees = Array.isArray(params.partecipanti) 
@@ -485,7 +560,7 @@ function normalizeGeminiResponse(parsedResult) {
   
   logDebug('Normalizzazione risposta Gemini:');
   logDebug('  Azione originale:', result.action, '→', standardAction);
-  logDebug('  Parametri normalizzati:', normalizedParams);
+  debugObject('  Parametri normalizzati', normalizedParams);
   
   return {
     action: standardAction,
@@ -506,12 +581,66 @@ async function executeCalendarAction(parsedCommand, calendar) {
       return await listEvents(calendar, parameters);
     case 'DELETE_EVENT':
       return await deleteEvent(calendar, parameters);
+    case 'DELETE_ALL_EVENTS':
+      return await deleteAllEvents(calendar, parameters);
     default:
       return { 
         success: false,
         message: 'Azione non supportata', 
         details: action 
       };
+  }
+}
+
+// Implementazione della nuova funzione per eliminare tutti gli eventi
+async function deleteAllEvents(calendar, params) {
+  try {
+    // Imposta intervallo temporale (oggi, o parametro specificato)
+    const today = new Date();
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    const timeMin = today.toISOString();
+    const timeMax = tomorrow.toISOString();
+    
+    // Trova tutti gli eventi
+    const response = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: timeMin,
+      timeMax: timeMax,
+      singleEvents: true
+    });
+    
+    const events = response.data.items || [];
+    
+    if (events.length === 0) {
+      return {
+        success: true,
+        message: 'Nessun evento trovato da eliminare'
+      };
+    }
+    
+    // Elimina tutti gli eventi trovati
+    let deletedCount = 0;
+    for (const event of events) {
+      try {
+        await calendar.events.delete({
+          calendarId: 'primary',
+          eventId: event.id
+        });
+        deletedCount++;
+      } catch (error) {
+        logError(`Errore nell'eliminazione evento ${event.id}:`, error.message);
+      }
+    }
+    
+    return {
+      success: true,
+      message: `Eliminati ${deletedCount} eventi`
+    };
+  } catch (error) {
+    logError('Errore nell\'eliminazione multiple di eventi:', error);
+    throw new Error(`Impossibile eliminare gli eventi: ${error.message}`);
   }
 }
 
@@ -532,7 +661,7 @@ async function createEvent(calendar, params) {
   };
 
   try {
-    logDebug('Creazione evento:', event);
+    debugObject('Creazione evento', event);
     const response = await calendar.events.insert({
       calendarId: 'primary',
       resource: event,
@@ -552,26 +681,52 @@ async function createEvent(calendar, params) {
 
 async function updateEvent(calendar, params) {
   try {
+    debugObject('Parametri evento originali', params);
+    
     // Prima dobbiamo trovare l'evento da aggiornare
     let eventId = params.eventId;
     
     if (!eventId && params.title) {
-      // Cerca per titolo se non abbiamo l'ID
+      // Cerca per titolo se non abbiamo l'ID - PERIODO DI RICERCA ESTESO
       logDebug('Ricerca evento per titolo:', params.title);
       const searchResponse = await calendar.events.list({
         calendarId: 'primary',
         q: params.title,
-        timeMin: new Date().toISOString(),
-        maxResults: 1,
+        timeMin: new Date(new Date().setDate(new Date().getDate() - 7)).toISOString(), // Cerca anche eventi recenti
+        maxResults: 10, // Aumentato per migliore ricerca
         singleEvents: true,
         orderBy: 'startTime',
       });
       
       if (searchResponse.data.items.length > 0) {
-        eventId = searchResponse.data.items[0].id;
-        logDebug('Evento trovato con ID:', eventId);
+        // Prima cerca il titolo esatto (case-insensitive)
+        let eventItem = searchResponse.data.items.find(item => 
+          item.summary.toLowerCase() === params.title.toLowerCase()
+        );
+        
+        // Se non trova, cerca corrispondenza parziale
+        if (!eventItem) {
+          // Estrai parole chiave dal titolo cercato
+          const keywords = params.title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+          
+          // Cerca eventi che contengono almeno una delle parole chiave
+          for (const event of searchResponse.data.items) {
+            const summary = event.summary.toLowerCase();
+            if (keywords.some(keyword => summary.includes(keyword))) {
+              eventItem = event;
+              logDebug(`Evento trovato con corrispondenza parziale per parola chiave: ${event.summary}`);
+              break;
+            }
+          }
+        }
+        
+        if (eventItem) {
+          eventId = eventItem.id;
+        } else {
+          throw new Error(`Evento "${params.title}" non trovato`);
+        }
       } else {
-        throw new Error('Evento non trovato');
+        throw new Error(`Evento "${params.title}" non trovato`);
       }
     }
     
@@ -582,6 +737,7 @@ async function updateEvent(calendar, params) {
     });
     
     const existingEvent = eventResponse.data;
+    debugObject('Evento esistente', existingEvent);
     
     // Prepara l'evento aggiornato
     const updatedEvent = {
@@ -605,12 +761,43 @@ async function updateEvent(calendar, params) {
       };
     }
     
+    // Se abbiamo solo l'ora ma non la data esplicita, manteniamo la data originale
+    if (params.ora_inizio && !params.data) {
+      const originalDate = new Date(existingEvent.start.dateTime);
+      const [hours, minutes] = params.ora_inizio.split(':').map(Number);
+      originalDate.setHours(hours || 0, minutes || 0, 0);
+      
+      if (!updatedEvent.start) {
+        updatedEvent.start = {
+          dateTime: originalDate.toISOString(),
+          timeZone: 'Europe/Rome',
+        };
+      } else {
+        updatedEvent.start.dateTime = originalDate.toISOString();
+      }
+      
+      // Imposta la fine a un'ora dopo se non specificata
+      if (!params.ora_fine) {
+        const endDate = new Date(originalDate);
+        endDate.setHours(endDate.getHours() + 1);
+        
+        if (!updatedEvent.end) {
+          updatedEvent.end = {
+            dateTime: endDate.toISOString(),
+            timeZone: 'Europe/Rome',
+          };
+        } else {
+          updatedEvent.end.dateTime = endDate.toISOString();
+        }
+      }
+    }
+    
     // Aggiorna partecipanti se forniti
     if (params.attendees) {
       updatedEvent.attendees = params.attendees.map(email => ({ email }));
     }
     
-    logDebug('Aggiornamento evento:', updatedEvent);
+    debugObject('Evento aggiornato', updatedEvent);
     const response = await calendar.events.update({
       calendarId: 'primary',
       eventId: eventId,
@@ -686,25 +873,50 @@ async function listEvents(calendar, params) {
 
 async function deleteEvent(calendar, params) {
   try {
+    debugObject('Parametri eliminazione evento', params);
     let eventId = params.eventId;
     
     if (!eventId && params.title) {
-      // Cerca per titolo se non abbiamo l'ID
+      // Cerca per titolo se non abbiamo l'ID - PERIODO DI RICERCA ESTESO
       logDebug('Ricerca evento da eliminare con titolo:', params.title);
       const searchResponse = await calendar.events.list({
         calendarId: 'primary',
         q: params.title,
-        timeMin: new Date().toISOString(),
-        maxResults: 1,
+        timeMin: new Date(new Date().setDate(new Date().getDate() - 7)).toISOString(), // Cerca anche eventi recenti
+        maxResults: 10, // Aumentato per migliore ricerca
         singleEvents: true,
         orderBy: 'startTime',
       });
       
       if (searchResponse.data.items.length > 0) {
-        eventId = searchResponse.data.items[0].id;
-        logDebug('Evento trovato con ID:', eventId);
+        // Prima cerca il titolo esatto (case-insensitive)
+        let eventItem = searchResponse.data.items.find(item => 
+          item.summary.toLowerCase() === params.title.toLowerCase()
+        );
+        
+        // Se non trova, cerca corrispondenza parziale
+        if (!eventItem) {
+          // Estrai parole chiave dal titolo cercato
+          const keywords = params.title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+          
+          // Cerca eventi che contengono almeno una delle parole chiave
+          for (const event of searchResponse.data.items) {
+            const summary = event.summary.toLowerCase();
+            if (keywords.some(keyword => summary.includes(keyword))) {
+              eventItem = event;
+              logDebug(`Evento trovato con corrispondenza parziale per parola chiave: ${event.summary}`);
+              break;
+            }
+          }
+        }
+        
+        if (eventItem) {
+          eventId = eventItem.id;
+        } else {
+          throw new Error(`Evento "${params.title}" non trovato`);
+        }
       } else {
-        throw new Error('Evento non trovato');
+        throw new Error(`Evento "${params.title}" non trovato`);
       }
     }
     
