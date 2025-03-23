@@ -120,7 +120,7 @@ const processCommand = async (command) => {
     
     // Tentativo di parsing
     try {
-      return parseGeminiResponse(geminiResult);
+      return parseGeminiResponse(geminiResult, command);
     } catch (parseError) {
       logger.error('Errore nel parsing della risposta Gemini:', parseError);
       logger.debug('Utilizzo parser locale di fallback dopo errore parsing');
@@ -148,9 +148,10 @@ const processCommand = async (command) => {
 /**
  * Analizza la risposta JSON di Gemini
  * @param {String} responseText - Testo della risposta da analizzare
+ * @param {String} originalCommand - Comando originale dell'utente
  * @returns {Object} Oggetto risultante
  */
-const parseGeminiResponse = (responseText) => {
+const parseGeminiResponse = (responseText, originalCommand) => {
   try {
     logger.debug('Inizio parsing risposta Gemini:', responseText.substring(0, 200) + '...');
     
@@ -167,7 +168,7 @@ const parseGeminiResponse = (responseText) => {
     const parsedResult = JSON.parse(jsonText);
     logger.debug('Parsing JSON completato con successo');
     
-    return normalizeResponse(parsedResult);
+    return normalizeResponse(parsedResult, originalCommand);
   } catch (error) {
     logger.error('Errore nel parsing della risposta:', error);
     throw error;
@@ -175,11 +176,45 @@ const parseGeminiResponse = (responseText) => {
 };
 
 /**
+ * Elabora un comando relativo temporale
+ * @param {String} command - Comando originale
+ * @param {Object} parameters - Parametri attuali
+ * @returns {Object} Parametri aggiornati
+ */
+const processRelativeTimeCommand = (command, parameters) => {
+  const lowerCommand = command.toLowerCase();
+  
+  // Gestione spostamenti relativi (avanti/indietro)
+  if (lowerCommand.includes('ora in avanti') || lowerCommand.includes('ore in avanti') || 
+      lowerCommand.includes('posticipa') || lowerCommand.includes('ritarda')) {
+    
+    // Estrai il numero di ore
+    const hourMatch = lowerCommand.match(/(\d+)\s*or[ae]/i);
+    const hoursToAdd = hourMatch ? parseInt(hourMatch[1]) : 1; // Default a 1 ora
+    
+    parameters.hoursToShift = hoursToAdd;
+    parameters.moveDirection = 'forward';
+  } 
+  else if (lowerCommand.includes('ora prima') || lowerCommand.includes('ore prima') || 
+           lowerCommand.includes('anticipa')) {
+    
+    const hourMatch = lowerCommand.match(/(\d+)\s*or[ae]/i);
+    const hoursToSubtract = hourMatch ? parseInt(hourMatch[1]) : 1; // Default a 1 ora
+    
+    parameters.hoursToShift = -hoursToSubtract;
+    parameters.moveDirection = 'backward';
+  }
+  
+  return parameters;
+};
+
+/**
  * Normalizza la risposta di Gemini
  * @param {Object} parsedResult - Risultato parsato da JSON
+ * @param {String} originalCommand - Comando originale dell'utente
  * @returns {Object} Risultato normalizzato
  */
-const normalizeResponse = (parsedResult) => {
+const normalizeResponse = (parsedResult, originalCommand) => {
   // Gestione struttura piatta vs nidificata
   if (!parsedResult.action && parsedResult.azione) {
     // Caso in cui abbiamo una risposta nel formato italiano non nidificato
@@ -273,6 +308,37 @@ const normalizeResponse = (parsedResult) => {
   if (action === 'VIEW_EVENTS' && !normalizedParams.maxResults) {
     normalizedParams.maxResults = 10;
   }
+
+  // Elaborazione per comandi relativi sugli orari
+  const lowerCommand = originalCommand.toLowerCase();
+  if (action === 'UPDATE_EVENT') {
+    // Processa comandi di spostamento temporale relativo
+    normalizedParams = processRelativeTimeCommand(originalCommand, normalizedParams);
+    
+    // Cerca espressioni come "di due ore", "di un'ora" ecc.
+    if (!normalizedParams.hoursToShift && 
+        (lowerCommand.includes('anticipa') || lowerCommand.includes('sposta') || 
+         lowerCommand.includes('posticipa') || lowerCommand.includes('ritarda'))) {
+      const hourMatch = lowerCommand.match(/di\s+(\d+)\s+or[ae]/i);
+      if (hourMatch) {
+        const hoursToShift = parseInt(hourMatch[1]);
+        // Determina se anticipare o posticipare
+        const isEarlier = lowerCommand.includes('anticipa') || lowerCommand.includes('prima');
+        normalizedParams.hoursToShift = isEarlier ? -hoursToShift : hoursToShift;
+        logger.debug(`Rilevato spostamento orario: ${normalizedParams.hoursToShift} ore`);
+      }
+    }
+  }
+  
+  // Gestione comandi generici
+  if (action === 'DELETE_EVENT' && (!normalizedParams || Object.keys(normalizedParams).length === 0)) {
+    // Se è un comando generico di eliminazione, assumiamo che voglia eliminare gli eventi di oggi
+    if (lowerCommand.includes('tutto') || lowerCommand.includes('tutti')) {
+      normalizedParams.date = 'oggi';
+      normalizedParams.deleteAll = true;
+      logger.debug('Rilevato comando di eliminazione di tutti gli eventi di oggi');
+    }
+  }
   
   return {
     action,
@@ -323,12 +389,39 @@ const parseCommandLocally = (command) => {
       parameters.date = 'domani';
     }
     
+    // Gestione comandi relativi all'orario
+    parameters = processRelativeTimeCommand(command, parameters);
+    
+    if (!parameters.hoursToShift && 
+        (lowerCommand.includes('anticipa') || lowerCommand.includes('sposta') || 
+         lowerCommand.includes('posticipa') || lowerCommand.includes('ritarda'))) {
+      // Cerca espressioni come "di due ore", "di un'ora" ecc.
+      const hourMatch = lowerCommand.match(/di\s+(\d+)\s+or[ae]/i);
+      if (hourMatch) {
+        const hoursToShift = parseInt(hourMatch[1]);
+        // Determina se anticipare o posticipare
+        const isEarlier = lowerCommand.includes('anticipa') || lowerCommand.includes('prima');
+        parameters.hoursToShift = isEarlier ? -hoursToShift : hoursToShift;
+        logger.debug(`Rilevato spostamento orario locale: ${parameters.hoursToShift} ore`);
+      }
+    }
+    
+    // Gestione comandi generici di eliminazione
+    if (action === 'DELETE_EVENT' && Object.keys(parameters).length === 0) {
+      if (lowerCommand.includes('tutto') || lowerCommand.includes('tutti')) {
+        parameters.date = 'oggi';
+        parameters.deleteAll = true;
+        logger.debug('Rilevato comando locale di eliminazione di tutti gli eventi di oggi');
+      }
+    }
+    
     // Determina l'azione
     if (lowerCommand.includes('crea')) {
       action = 'CREATE_EVENT';
     } else if (lowerCommand.includes('mostra')) {
       action = 'VIEW_EVENTS';
-    } else if (lowerCommand.includes('modifica')) {
+    } else if (lowerCommand.includes('modifica') || lowerCommand.includes('sposta') || 
+               lowerCommand.includes('anticipa') || lowerCommand.includes('posticipa')) {
       action = 'UPDATE_EVENT';
     } else if (lowerCommand.includes('elimina')) {
       action = 'DELETE_EVENT';

@@ -25,6 +25,23 @@ const createEvent = async (auth, params) => {
     const endDateTime = params.endTime 
       ? prepareDateTime(params.date, params.endTime)
       : new Date(startDateTime.getTime() + 60 * 60 * 1000); // +1 ora di default
+      
+    // Verifica se esiste già un evento con titolo simile nella stessa data/ora
+    const existingEvents = await calendar.events.list({
+      calendarId: 'primary',
+      timeMin: startDateTime.toISOString(),
+      timeMax: new Date(startDateTime.getTime() + 5 * 60 * 1000).toISOString(), // Finestra di 5 minuti
+      q: params.title
+    });
+
+    if (existingEvents.data.items && existingEvents.data.items.length > 0) {
+      return {
+        success: false,
+        message: 'Sembra che esista già un evento simile in questo orario',
+        potentialDuplicate: true,
+        existingEventId: existingEvents.data.items[0].id
+      };
+    }
     
     // Prepara risorsa evento
     const event = {
@@ -97,8 +114,30 @@ const updateEvent = async (auth, params) => {
       description: params.description !== undefined ? params.description : existingEvent.description,
     };
     
-    // Aggiorna date se fornite
-    if (params.date || params.startTime) {
+    // Gestione spostamento relativo (ore in avanti/indietro)
+    if (params.hoursToShift) {
+      const originalStartDate = new Date(existingEvent.start.dateTime || existingEvent.start.date);
+      const originalEndDate = new Date(existingEvent.end.dateTime || existingEvent.end.date);
+      
+      // Calcola nuovi orari sommando/sottraendo ore
+      const hoursToAdd = params.hoursToShift;
+      const newStartDateTime = new Date(originalStartDate.getTime() + hoursToAdd * 60 * 60 * 1000);
+      const newEndDateTime = new Date(originalEndDate.getTime() + hoursToAdd * 60 * 60 * 1000);
+      
+      updatedEvent.start = {
+        dateTime: newStartDateTime.toISOString(),
+        timeZone: 'Europe/Rome',
+      };
+      
+      updatedEvent.end = {
+        dateTime: newEndDateTime.toISOString(),
+        timeZone: 'Europe/Rome',
+      };
+      
+      logger.debug(`Spostamento relativo: ${hoursToAdd} ore. Nuovo orario: ${newStartDateTime.toLocaleTimeString()}`);
+    }
+    // Aggiornamento orario specifico
+    else if (params.date || params.startTime) {
       const originalStartDate = new Date(existingEvent.start.dateTime || existingEvent.start.date);
       const startDateTime = prepareDateTime(
         params.date || originalStartDate,
@@ -123,25 +162,28 @@ const updateEvent = async (auth, params) => {
           timeZone: 'Europe/Rome',
         };
       }
-    }
-    
-    // Aggiorna ora di fine se fornita
-    if (params.endTime) {
-      const startDate = new Date(updatedEvent.start.dateTime);
-      const endDateTime = prepareDateTime(
-        params.date || startDate,
-        params.endTime
-      );
       
-      updatedEvent.end = {
-        dateTime: endDateTime.toISOString(),
-        timeZone: 'Europe/Rome',
-      };
+      // Aggiorna ora di fine se fornita
+      if (params.endTime) {
+        const startDate = new Date(updatedEvent.start.dateTime);
+        const endDateTime = prepareDateTime(
+          params.date || startDate,
+          params.endTime
+        );
+        
+        updatedEvent.end = {
+          dateTime: endDateTime.toISOString(),
+          timeZone: 'Europe/Rome',
+        };
+      }
     }
     
     // Aggiorna partecipanti se forniti
-    if (params.attendees) {
+    if (params.attendees && params.attendees.length > 0) {
       updatedEvent.attendees = prepareAttendees(params.attendees);
+    } else if (params.attendees && params.attendees.length === 0 && existingEvent.attendees) {
+      // Mantieni i partecipanti esistenti se l'array è vuoto
+      updatedEvent.attendees = existingEvent.attendees;
     }
     
     logger.debug('Richiesta aggiornamento evento:', updatedEvent);
@@ -242,11 +284,55 @@ const deleteEvent = async (auth, params) => {
   try {
     const calendar = google.calendar({ version: 'v3', auth });
     
-    // Trova l'evento da eliminare
+    // Se abbiamo una data ma non un ID o titolo specifico, o se è una richiesta di eliminazione completa
+    if ((params.date && !params.eventId && !params.title) || params.deleteAll) {
+      logger.debug('Eliminazione di tutti gli eventi per la data:', params.date);
+      
+      // Ottieni inizio e fine della data specificata
+      const dateObj = dateUtils.parseDateFromText(params.date);
+      const timeMin = new Date(dateObj.setHours(0, 0, 0, 0)).toISOString();
+      const timeMax = new Date(dateObj.setHours(23, 59, 59, 999)).toISOString();
+      
+      // Cerca gli eventi per quella data
+      const eventsResponse = await calendar.events.list({
+        calendarId: 'primary',
+        timeMin: timeMin,
+        timeMax: timeMax,
+        singleEvents: true
+      });
+      
+      const events = eventsResponse.data.items;
+      
+      if (!events || events.length === 0) {
+        return {
+          success: true,
+          message: 'Nessun evento trovato per la data specificata'
+        };
+      }
+      
+      // Elimina ogni evento trovato
+      for (const event of events) {
+        await calendar.events.delete({
+          calendarId: 'primary',
+          eventId: event.id,
+        });
+      }
+      
+      return {
+        success: true,
+        message: `Eliminati ${events.length} eventi per la data specificata`
+      };
+    }
+    
+    // Caso standard: eliminazione di un evento specifico
     let eventId = params.eventId;
     
     if (!eventId && params.title) {
       eventId = await findEventByTitle(calendar, params.title);
+    }
+    
+    if (!eventId) {
+      throw new Error('ID evento non specificato e impossibile trovare evento dal titolo');
     }
     
     logger.debug('Eliminazione evento con ID:', eventId);
@@ -275,51 +361,57 @@ const deleteEvent = async (auth, params) => {
 const findEventByTitle = async (calendar, title) => {
   logger.debug('Ricerca evento per titolo:', title);
   
-  // Cerca eventi recenti (da 7 giorni fa a 30 giorni in avanti)
+  // Cerca eventi recenti
   const now = new Date();
   const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const oneMonthAhead = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
   
   const searchResponse = await calendar.events.list({
     calendarId: 'primary',
-    q: title,
     timeMin: oneWeekAgo.toISOString(),
     timeMax: oneMonthAhead.toISOString(),
-    maxResults: 10,
+    maxResults: 20,
     singleEvents: true,
     orderBy: 'startTime',
   });
   
   if (!searchResponse.data.items || searchResponse.data.items.length === 0) {
-    throw new Error(`Evento "${title}" non trovato`);
+    throw new Error(`Nessun evento trovato per il periodo ricercato`);
   }
   
-  // Prima cerca il titolo esatto (case-insensitive)
-  let eventItem = searchResponse.data.items.find(item => 
-    item.summary.toLowerCase() === title.toLowerCase()
-  );
+  // Normalizza il titolo di ricerca e crea varianti
+  const searchTitle = title.toLowerCase();
+  const searchVariants = [
+    searchTitle,
+    searchTitle.replace('con', 'di'),
+    searchTitle.replace('di', 'con'),
+    searchTitle.split(' ').pop() // Solo l'ultima parola (es. nome persona)
+  ];
   
-  // Se non trova, cerca corrispondenza parziale
-  if (!eventItem) {
-    // Estrai parole chiave dal titolo cercato
-    const keywords = title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+  // Prima cerca corrispondenza esatta, poi parziale con varianti
+  for (const event of searchResponse.data.items) {
+    const eventTitle = event.summary.toLowerCase();
     
-    // Cerca eventi che contengono almeno una delle parole chiave
-    for (const event of searchResponse.data.items) {
-      const summary = event.summary.toLowerCase();
-      if (keywords.some(keyword => summary.includes(keyword))) {
-        eventItem = event;
-        logger.debug(`Evento trovato con corrispondenza parziale: ${event.summary}`);
-        break;
-      }
+    // Corrispondenza esatta
+    if (eventTitle === searchTitle) {
+      return event.id;
+    }
+    
+    // Prova con le varianti
+    if (searchVariants.some(variant => eventTitle.includes(variant))) {
+      logger.debug(`Evento trovato con corrispondenza parziale: ${event.summary}`);
+      return event.id;
+    }
+    
+    // Cerca evento con nome della persona
+    const attendeeMatch = searchTitle.match(/(?:con|di)\s+([A-Za-z]+)/i);
+    if (attendeeMatch && eventTitle.includes(attendeeMatch[1].toLowerCase())) {
+      logger.debug(`Evento trovato con corrispondenza partecipante: ${event.summary}`);
+      return event.id;
     }
   }
   
-  if (!eventItem) {
-    throw new Error(`Evento "${title}" non trovato`);
-  }
-  
-  return eventItem.id;
+  throw new Error(`Evento "${title}" non trovato`);
 };
 
 /**
