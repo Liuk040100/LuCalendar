@@ -57,8 +57,13 @@ const oauth2Client = new google.auth.OAuth2(
   process.env.REDIRECT_URI
 );
 
-// Funzione per assicurare che il token sia valido
+// Funzione migliorata per assicurare che il token sia valido
 async function ensureValidToken(req) {
+  // Verifica iniziale più robusta per la presenza dei token
+  if (!req.session || !req.session.tokens) {
+    throw new Error('Nessun token disponibile');
+  }
+
   if (req.session.tokens && req.session.tokens.access_token) {
     const expiryDate = req.session.tokens.expiry_date;
     const now = new Date().getTime();
@@ -69,17 +74,20 @@ async function ensureValidToken(req) {
         
         // Verifica che il refresh_token esista
         if (!req.session.tokens.refresh_token) {
-          req.session.tokens = null; // Pulisci token non validi
+          // Pulisci token non validi in modo sicuro
+          req.session.tokens = null;
+          await new Promise(resolve => req.session.save(resolve));
           throw new Error('Refresh token mancante, richiesta riautenticazione');
         }
         
         oauth2Client.setCredentials(req.session.tokens);
         const result = await oauth2Client.refreshToken(req.session.tokens.refresh_token);
         
-        // Verifica che result.credentials contenga i dati necessari
+        // Verifica più rigorosa dei dati di ritorno
         if (!result || !result.credentials || !result.credentials.access_token) {
           req.session.tokens = null;
-          throw new Error('Token refresh non riuscito');
+          await new Promise(resolve => req.session.save(resolve));
+          throw new Error('Token refresh non riuscito: dati incompleti');
         }
         
         req.session.tokens = result.credentials;
@@ -96,8 +104,9 @@ async function ensureValidToken(req) {
         console.log('Token refreshed successfully');
       } catch (error) {
         console.error('Errore nel refresh del token:', error.message);
-        // Resetta i token in sessione per forzare un nuovo login
+        // Resetta i token in sessione in modo sicuro
         req.session.tokens = null;
+        await new Promise(resolve => req.session.save(resolve));
         throw new Error('Sessione scaduta, effettua nuovamente il login');
       }
     } else {
@@ -194,7 +203,7 @@ app.post('/api/process-command', async (req, res) => {
   }
 });
 
-// Funzione per elaborare comandi con Gemini
+// Funzione migliorata per elaborare comandi con Gemini
 async function processWithGemini(command, calendarClient) {
   // Endpoint corretto verificato
   const GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
@@ -268,36 +277,56 @@ Risposta:
 
     logDebug('Risposta ricevuta da Gemini API');
     
-    // Estrai il testo dalla risposta
-    if (!response.data.candidates || !response.data.candidates[0] || 
-        !response.data.candidates[0].content || !response.data.candidates[0].content.parts) {
-      throw new Error('Formato risposta Gemini non valido');
+    // Miglioramento validazione risposta
+    if (!response.data.candidates || 
+        !response.data.candidates[0] || 
+        !response.data.candidates[0].content || 
+        !response.data.candidates[0].content.parts ||
+        !response.data.candidates[0].content.parts[0]) {
+      throw new Error('Formato risposta Gemini non valido o vuoto');
     }
     
     const geminiResult = response.data.candidates[0].content.parts[0].text;
     
-    // Pulisci il testo della risposta (rimuovi backtick se presenti)
-    const cleanedResult = geminiResult.replace(/```json/g, '').replace(/```/g, '').trim();
+    // Verifica ulteriore che il testo non sia vuoto
+    if (!geminiResult || typeof geminiResult !== 'string') {
+      throw new Error('Risposta Gemini vuota o non valida');
+    }
     
     try {
-      // Prima rimuovi eventuali prefissi o testo non JSON
-      let cleanedResult2 = geminiResult;
+      // Miglioramento estrazione JSON
+      let jsonText = geminiResult;
       
-      // Se inizia con "Comando:" o altre stringhe note
-      const jsonStartIndex = cleanedResult2.indexOf('{');
-      if (jsonStartIndex > 0) {
-        cleanedResult2 = cleanedResult2.substring(jsonStartIndex);
+      // Rimuovi qualsiasi testo prima del primo '{'
+      const jsonStartIndex = jsonText.indexOf('{');
+      if (jsonStartIndex >= 0) {
+        jsonText = jsonText.substring(jsonStartIndex);
+      } else {
+        throw new Error('Nessun oggetto JSON trovato nella risposta');
       }
       
-      // Rimuovi eventuali suffissi
-      const jsonEndIndex = cleanedResult2.lastIndexOf('}');
-      if (jsonEndIndex > 0 && jsonEndIndex < cleanedResult2.length - 1) {
-        cleanedResult2 = cleanedResult2.substring(0, jsonEndIndex + 1);
+      // Rimuovi qualsiasi testo dopo l'ultimo '}'
+      const jsonEndIndex = jsonText.lastIndexOf('}');
+      if (jsonEndIndex >= 0) {
+        jsonText = jsonText.substring(0, jsonEndIndex + 1);
+      } else {
+        throw new Error('JSON non terminato correttamente');
       }
+      
+      // Rimuovi caratteri di escape o formattazione che potrebbero interferire
+      jsonText = jsonText.replace(/\\n/g, ' ').replace(/\\"/g, '"');
+      
+      // Aggiungi un logging dettagliato del testo che stiamo per analizzare
+      logDebug('Tentativo di parsing JSON:', jsonText);
       
       // Ora prova a fare il parsing
-      const parsedResult = JSON.parse(cleanedResult2);
+      const parsedResult = JSON.parse(jsonText);
       logDebug('Interpretazione comando:', parsedResult);
+      
+      // Verifica che l'oggetto parsato abbia la struttura attesa
+      if (!parsedResult.action || !parsedResult.parameters) {
+        throw new Error('Struttura JSON non valida: mancano campi obbligatori');
+      }
       
       // Normalizza la risposta
       const normalizedResult = normalizeGeminiResponse(parsedResult);
@@ -305,12 +334,31 @@ Risposta:
       // Esegui l'azione appropriata sul calendario
       return await executeCalendarAction(normalizedResult, calendarClient);
     } catch (parseError) {
-      logError('Errore nel parsing JSON della risposta:', cleanedResult);
+      logError('Errore nel parsing JSON della risposta:', geminiResult);
       logError('Dettaglio errore:', parseError);
       
-      // Fallback a un parser locale semplice
-      logDebug('Utilizzo parser locale di fallback');
+      // Fallback migliorato - tenta di estrarre manualmente i dati chiave
+      logDebug('Tentativo di estrazione manuale dei dati chiave');
+      
+      // Vedi se possiamo identificare l'azione
+      let action = '';
+      if (geminiResult.includes('crea') || geminiResult.includes('nuovo')) {
+        action = 'CREATE_EVENT';
+      } else if (geminiResult.includes('modifica') || geminiResult.includes('aggiorna')) {
+        action = 'UPDATE_EVENT';
+      } else if (geminiResult.includes('visualizza') || geminiResult.includes('mostra')) {
+        action = 'VIEW_EVENTS';
+      } else if (geminiResult.includes('elimina') || geminiResult.includes('cancella')) {
+        action = 'DELETE_EVENT';
+      } else {
+        action = 'VIEW_EVENTS'; // Default fallback
+      }
+      
+      // Fallback al parser locale
+      logDebug('Utilizzo parser locale di fallback con azione:', action);
       const fallbackResult = basicCommandParser(command);
+      fallbackResult.action = action; // Override con l'azione identificata
+      
       return await executeCalendarAction(fallbackResult, calendarClient);
     }
   } catch (error) {
@@ -324,7 +372,7 @@ Risposta:
       });
     }
     
-    // Fallback a un parser locale semplice se l'API fallisce
+    // Fallback a un parser locale migliorato
     logDebug('Utilizzo parser locale di fallback');
     const fallbackResult = basicCommandParser(command);
     return await executeCalendarAction(fallbackResult, calendarClient);
