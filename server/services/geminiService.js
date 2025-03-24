@@ -11,9 +11,8 @@ const logger = createLogger('gemini-service');
  * Sistema prompt per l'interpretazione dei comandi del calendario
  */
 const SYSTEM_PROMPT = `Sei un assistente che aiuta a gestire il calendario Google. 
-Interpreta il comando dell'utente per determinare quale operazione eseguire:
-
-La tua risposta DEVE essere in formato JSON con questa ESATTA struttura:
+IMPORTANTE: RISPONDI SOLO IN FORMATO JSON.
+Interpreta il comando dell'utente per determinare quale operazione eseguire e restituisci un JSON con questa struttura:
 {
   "action": "[AZIONE]",
   "parameters": {
@@ -22,7 +21,13 @@ La tua risposta DEVE essere in formato JSON con questa ESATTA struttura:
     "startTime": "Ora inizio",
     "endTime": "Ora fine",
     "description": "Descrizione",
-    "attendees": ["nome1", "nome2"]
+    "attendees": ["nome1", "nome2"],
+    "timeModification": {
+      "type": "SHIFT",
+      "direction": "FORWARD/BACKWARD",
+      "amount": 1,
+      "unit": "HOUR/MINUTE"
+    }
   }
 }
 
@@ -31,6 +36,12 @@ Dove [AZIONE] deve essere uno di questi valori esatti:
 - "UPDATE_EVENT" (per modificare un evento esistente)
 - "VIEW_EVENTS" (per visualizzare eventi esistenti)
 - "DELETE_EVENT" (per eliminare un evento)
+
+Per comandi come "posticipa", "anticipa", "sposta", aggiungi l'oggetto "timeModification" con:
+- "type": "SHIFT" 
+- "direction": "FORWARD" (per posticipare) o "BACKWARD" (per anticipare)
+- "amount": il numero di unità di tempo
+- "unit": "HOUR" o "MINUTE"
 
 Esempio:
 Comando: "Crea una riunione con Mario domani alle 15"
@@ -43,6 +54,22 @@ Risposta:
     "startTime": "15:00",
     "endTime": "16:00",
     "attendees": ["Mario"]
+  }
+}
+
+Esempio:
+Comando: "Posticipa la riunione con Mario di un'ora"
+Risposta:
+{
+  "action": "UPDATE_EVENT",
+  "parameters": {
+    "title": "Riunione con Mario",
+    "timeModification": {
+      "type": "SHIFT",
+      "direction": "FORWARD",
+      "amount": 1,
+      "unit": "HOUR"
+    }
   }
 }`;
 
@@ -155,8 +182,22 @@ const parseGeminiResponse = (responseText, originalCommand) => {
   try {
     logger.debug('Inizio parsing risposta Gemini:', responseText.substring(0, 200) + '...');
     
+    // Verifica se la risposta contiene JSON
+    if (!responseText.includes('{') || !responseText.includes('}')) {
+      logger.error('Risposta non contiene JSON valido:', responseText);
+      throw new Error('Risposta Gemini non in formato JSON');
+    }
+    
     // Estrai il JSON dalla risposta (rimuovi backticks e tag json)
     let jsonText = responseText.replace(/```json|```/g, '').trim();
+    
+    // Trova l'inizio e la fine del JSON
+    const startIndex = jsonText.indexOf('{');
+    const endIndex = jsonText.lastIndexOf('}') + 1;
+    
+    if (startIndex >= 0 && endIndex > startIndex) {
+      jsonText = jsonText.substring(startIndex, endIndex);
+    }
     
     // Sanitizza il JSON prima del parsing
     // Corregge problemi come "15":00" -> "15:00"
@@ -173,6 +214,59 @@ const parseGeminiResponse = (responseText, originalCommand) => {
     logger.error('Errore nel parsing della risposta:', error);
     throw error;
   }
+};
+
+/**
+ * Estrae informazioni sulla modifica temporale da un comando
+ * @param {String} command - Comando originale
+ * @returns {Object|null} Informazioni sulla modifica temporale o null
+ */
+const extractTimeModification = (command) => {
+  const lowerCommand = command.toLowerCase();
+  
+  // Gestione anticipo/posticipo
+  if (lowerCommand.includes('posticipa') || lowerCommand.includes('ritarda') || 
+      lowerCommand.includes('sposta') || lowerCommand.includes('ora in avanti') || 
+      lowerCommand.includes('ore in avanti')) {
+    
+    // Estrai il numero di ore
+    const hourMatch = lowerCommand.match(/(\d+)\s*or[ae]/i);
+    const hours = hourMatch ? parseInt(hourMatch[1]) : 1; // Default a 1 ora
+    
+    return {
+      type: "SHIFT",
+      direction: "FORWARD",
+      amount: hours,
+      unit: "HOUR"
+    };
+  } 
+  else if (lowerCommand.includes('anticipa') || lowerCommand.includes('ora prima') || 
+           lowerCommand.includes('ore prima')) {
+    
+    const hourMatch = lowerCommand.match(/(\d+)\s*or[ae]/i);
+    const hours = hourMatch ? parseInt(hourMatch[1]) : 1; // Default a 1 ora
+    
+    return {
+      type: "SHIFT",
+      direction: "BACKWARD",
+      amount: hours,
+      unit: "HOUR"
+    };
+  }
+  
+  // Gestione spostamento a ora specifica
+  const specificTimeMatch = lowerCommand.match(/(sposta|posticipa|anticipa).+alle\s+(\d{1,2})[:\.]?(\d{2})?/i);
+  if (specificTimeMatch) {
+    const hours = parseInt(specificTimeMatch[2]);
+    const minutes = specificTimeMatch[3] ? parseInt(specificTimeMatch[3]) : 0;
+    
+    return {
+      type: "EXACT",
+      time: `${hours}:${minutes < 10 ? '0' + minutes : minutes}`
+    };
+  }
+  
+  return null;
 };
 
 /**
@@ -269,7 +363,7 @@ const normalizeResponse = (parsedResult, originalCommand) => {
   const parameters = parsedResult.parameters || {};
   
   // Normalizza i nomi dei parametri
-  const normalizedParams = {};
+  let normalizedParams = {};
   
   if (parameters.title || parameters.titolo) {
     normalizedParams.title = parameters.title || parameters.titolo;
@@ -300,6 +394,17 @@ const normalizeResponse = (parsedResult, originalCommand) => {
     }
   }
   
+  // Gestione della modifica temporale
+  if (parameters.timeModification) {
+    normalizedParams.timeModification = parameters.timeModification;
+  } else if (!parameters.startTime && !parameters.endTime) {
+    // Aggiungi modifiche temporali solo se non ci sono già orari specifici
+    const timeModification = extractTimeModification(originalCommand);
+    if (timeModification) {
+      normalizedParams.timeModification = timeModification;
+    }
+  }
+  
   if (parameters.query) {
     normalizedParams.query = parameters.query;
   }
@@ -307,37 +412,6 @@ const normalizeResponse = (parsedResult, originalCommand) => {
   // Per azioni di visualizzazione, aggiungi limiti predefiniti
   if (action === 'VIEW_EVENTS' && !normalizedParams.maxResults) {
     normalizedParams.maxResults = 10;
-  }
-
-  // Elaborazione per comandi relativi sugli orari
-  const lowerCommand = originalCommand.toLowerCase();
-  if (action === 'UPDATE_EVENT') {
-    // Processa comandi di spostamento temporale relativo
-    normalizedParams = processRelativeTimeCommand(originalCommand, normalizedParams);
-    
-    // Cerca espressioni come "di due ore", "di un'ora" ecc.
-    if (!normalizedParams.hoursToShift && 
-        (lowerCommand.includes('anticipa') || lowerCommand.includes('sposta') || 
-         lowerCommand.includes('posticipa') || lowerCommand.includes('ritarda'))) {
-      const hourMatch = lowerCommand.match(/di\s+(\d+)\s+or[ae]/i);
-      if (hourMatch) {
-        const hoursToShift = parseInt(hourMatch[1]);
-        // Determina se anticipare o posticipare
-        const isEarlier = lowerCommand.includes('anticipa') || lowerCommand.includes('prima');
-        normalizedParams.hoursToShift = isEarlier ? -hoursToShift : hoursToShift;
-        logger.debug(`Rilevato spostamento orario: ${normalizedParams.hoursToShift} ore`);
-      }
-    }
-  }
-  
-  // Gestione comandi generici
-  if (action === 'DELETE_EVENT' && (!normalizedParams || Object.keys(normalizedParams).length === 0)) {
-    // Se è un comando generico di eliminazione, assumiamo che voglia eliminare gli eventi di oggi
-    if (lowerCommand.includes('tutto') || lowerCommand.includes('tutti')) {
-      normalizedParams.date = 'oggi';
-      normalizedParams.deleteAll = true;
-      logger.debug('Rilevato comando di eliminazione di tutti gli eventi di oggi');
-    }
   }
   
   return {
@@ -355,12 +429,23 @@ const parseCommandLocally = (command) => {
   logger.debug('Parsing locale del comando:', command);
   const lowerCommand = command.toLowerCase();
   let action = null;
-  const parameters = {};
+  let parameters = {};
   
   try {
+    // Nella funzione parseCommandLocally
+    if (lowerCommand.includes('elimina tutto')) {
+      action = 'DELETE_EVENT';
+      parameters = {
+        date: 'oggi',
+        deleteAll: true
+      };
+      logger.debug('Rilevato comando di eliminazione di tutti gli eventi');
+      return { action, parameters };
+    }
+    
     // Estrazione più accurata del titolo
     if (lowerCommand.includes('riunione con') || lowerCommand.includes('appuntamento con')) {
-      const match = command.match(/(?:riunione|appuntamento) con ([^\d]+)/i);
+      const match = command.match(/(?:riunione|appuntamento) con ([A-Za-z]+)(?:\s|$)/i);
       if (match && match[1]) {
         parameters.title = `Riunione con ${match[1].trim()}`;
         // Estrai solo il nome della persona come partecipante
@@ -372,7 +457,7 @@ const parseCommandLocally = (command) => {
       parameters.title = 'Nuovo evento';
     }
     
-    // Estrai orario (resta invariato)
+    // Estrai orario
     const timeMatch = command.match(/(\d{1,2})[:\.]?(\d{2})?\s*$/);
     if (timeMatch) {
       const hours = parseInt(timeMatch[1]);
@@ -389,30 +474,10 @@ const parseCommandLocally = (command) => {
       parameters.date = 'domani';
     }
     
-    // Gestione comandi relativi all'orario
-    parameters = processRelativeTimeCommand(command, parameters);
-    
-    if (!parameters.hoursToShift && 
-        (lowerCommand.includes('anticipa') || lowerCommand.includes('sposta') || 
-         lowerCommand.includes('posticipa') || lowerCommand.includes('ritarda'))) {
-      // Cerca espressioni come "di due ore", "di un'ora" ecc.
-      const hourMatch = lowerCommand.match(/di\s+(\d+)\s+or[ae]/i);
-      if (hourMatch) {
-        const hoursToShift = parseInt(hourMatch[1]);
-        // Determina se anticipare o posticipare
-        const isEarlier = lowerCommand.includes('anticipa') || lowerCommand.includes('prima');
-        parameters.hoursToShift = isEarlier ? -hoursToShift : hoursToShift;
-        logger.debug(`Rilevato spostamento orario locale: ${parameters.hoursToShift} ore`);
-      }
-    }
-    
-    // Gestione comandi generici di eliminazione
-    if (action === 'DELETE_EVENT' && Object.keys(parameters).length === 0) {
-      if (lowerCommand.includes('tutto') || lowerCommand.includes('tutti')) {
-        parameters.date = 'oggi';
-        parameters.deleteAll = true;
-        logger.debug('Rilevato comando locale di eliminazione di tutti gli eventi di oggi');
-      }
+    // Estrazione delle modifiche temporali
+    const timeModification = extractTimeModification(command);
+    if (timeModification) {
+      parameters.timeModification = timeModification;
     }
     
     // Determina l'azione
@@ -426,16 +491,12 @@ const parseCommandLocally = (command) => {
     } else if (lowerCommand.includes('elimina')) {
       action = 'DELETE_EVENT';
     } else {
-      action = 'CREATE_EVENT'; // Default
+      action = 'VIEW_EVENTS'; // Default modificato a visualizzazione
     }
-    
-    logger.debug('Azione determinata dal parser locale:', action);
-    logger.debug('Parametri estratti dal parser locale:', parameters);
     
     return { action, parameters };
   } catch (error) {
     logger.error('Errore nel parser locale:', error);
-    // Fallback sicuro
     return {
       action: 'VIEW_EVENTS',
       parameters: { maxResults: 5 }
