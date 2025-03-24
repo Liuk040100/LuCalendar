@@ -9,6 +9,16 @@ const dateUtils = require('../utils/dateUtils');
 const logger = createLogger('calendar-service');
 
 /**
+ * Aggiunto: variabile per memorizzare l'ultimo evento gestito
+ * Aggiungi questo all'inizio del file, dopo le importazioni
+ */
+let lastHandledEventContext = {
+  id: null,
+  title: null,
+  timestamp: null
+};
+
+/**
  * Crea un evento nel calendario
  * @param {Object} auth - Client OAuth2 autenticato
  * @param {Object} params - Parametri dell'evento
@@ -80,10 +90,200 @@ const createEvent = async (auth, params) => {
 };
 
 /**
- * Aggiorna un evento esistente
- * @param {Object} auth - Client OAuth2 autenticato
- * @param {Object} params - Parametri dell'evento
- * @returns {Object} Risultato dell'operazione
+ * Aggiunto: Aggiorna il contesto dell'ultimo evento gestito
+ * Aggiungi questa funzione nuova al file
+ */
+const updateEventContext = (eventId, eventTitle) => {
+  if (eventId && eventTitle) {
+    lastHandledEventContext = {
+      id: eventId,
+      title: eventTitle,
+      timestamp: Date.now()
+    };
+    logger.debug('Contesto evento aggiornato:', lastHandledEventContext);
+  }
+};
+
+/**
+ * Aggiunto: Ottiene l'ID dell'ultimo evento dal contesto se è ancora valido
+ * Aggiungi questa funzione nuova al file
+ */
+const getLastEventIdFromContext = () => {
+  const contextTimeValid = 5 * 60 * 1000; // 5 minuti
+  
+  if (lastHandledEventContext.id && 
+      lastHandledEventContext.timestamp && 
+      (Date.now() - lastHandledEventContext.timestamp) < contextTimeValid) {
+    logger.debug('Utilizzando contesto evento:', lastHandledEventContext);
+    return lastHandledEventContext.id;
+  }
+  
+  return null;
+};
+
+/**
+ * Aggiunto: Trova l'evento più recente per tipo
+ * Aggiungi questa funzione nuova al file
+ */
+const findMostRecentEventByType = async (calendar, eventType) => {
+  const now = new Date();
+  const threeDaysAgo = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+  const threeDaysAhead = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+  
+  logger.debug(`Ricerca eventi recenti di tipo "${eventType}"`);
+  
+  const searchResponse = await calendar.events.list({
+    calendarId: 'primary',
+    timeMin: threeDaysAgo.toISOString(),
+    timeMax: threeDaysAhead.toISOString(),
+    maxResults: 10,
+    singleEvents: true,
+    orderBy: 'startTime',
+  });
+  
+  if (!searchResponse.data.items || searchResponse.data.items.length === 0) {
+    throw new Error(`Nessun evento trovato nel periodo corrente`);
+  }
+  
+  // Filtra per tipo e ordina per prossimità alla data corrente
+  const filteredEvents = searchResponse.data.items.filter(event => 
+    event.summary.toLowerCase().includes(eventType.toLowerCase())
+  );
+  
+  if (filteredEvents.length === 0) {
+    throw new Error(`Nessun evento di tipo "${eventType}" trovato`);
+  }
+  
+  // Ordina per prossimità alla data corrente
+  filteredEvents.sort((a, b) => {
+    const dateA = new Date(a.start.dateTime || a.start.date);
+    const dateB = new Date(b.start.dateTime || b.start.date);
+    return Math.abs(dateA - now) - Math.abs(dateB - now);
+  });
+  
+  logger.debug(`Trovato evento più recente di tipo "${eventType}": ${filteredEvents[0].summary}`);
+  return filteredEvents[0].id;
+};
+
+/**
+ * SOSTITUISCI COMPLETAMENTE questa funzione findEventByTitle esistente
+ * con questa versione migliorata
+ */
+const findEventByTitle = async (calendar, title) => {
+  logger.debug('Ricerca evento per titolo:', title);
+  
+  // Cerca eventi recenti in un intervallo più ampio
+  const now = new Date();
+  const twoWeeksAgo = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const oneMonthAhead = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  
+  // Aumenta il numero di risultati per una ricerca più ampia
+  const searchResponse = await calendar.events.list({
+    calendarId: 'primary',
+    timeMin: twoWeeksAgo.toISOString(),
+    timeMax: oneMonthAhead.toISOString(),
+    maxResults: 50,  // Aumentato da 20 a 50
+    singleEvents: true,
+    orderBy: 'startTime',
+  });
+  
+  logger.debug(`Trovati ${searchResponse.data.items?.length || 0} eventi da esaminare`);
+  
+  if (!searchResponse.data.items || searchResponse.data.items.length === 0) {
+    throw new Error(`Nessun evento trovato per il periodo ricercato`);
+  }
+  
+  // Normalizza il titolo di ricerca e crea varianti più ampie
+  const searchTitle = title.toLowerCase();
+  const searchWords = searchTitle.split(/\s+/);
+  const searchVariants = [
+    searchTitle,                                   // Titolo completo
+    searchTitle.replace(/con\s+/, ''),            // Rimuovi "con"
+    searchWords.length > 1 ? searchWords[0] : '', // Prima parola
+    searchWords.length > 1 ? searchWords[searchWords.length-1] : '' // Ultima parola
+  ].filter(v => v.length > 0);
+  
+  // Aggiungi nomi di persone come varianti di ricerca
+  const personMatch = searchTitle.match(/\b([A-Za-z]+)\b/g);
+  if (personMatch) {
+    personMatch.forEach(name => {
+      if (name.length > 2 && !['con', 'alle', 'del', 'di'].includes(name)) {
+        searchVariants.push(name);
+      }
+    });
+  }
+  
+  logger.debug('Varianti di ricerca:', searchVariants);
+
+  // Prima tenta con corrispondenza esatta
+  let bestMatch = null;
+  let bestMatchScore = 0;
+  
+  // Implementa un sistema di punteggio per trovare la migliore corrispondenza
+  for (const event of searchResponse.data.items) {
+    const eventTitle = event.summary.toLowerCase();
+    let score = 0;
+    
+    // Corrispondenza esatta
+    if (eventTitle === searchTitle) {
+      score = 100;
+    } else {
+      // Corrispondenza parziale con varianti
+      for (const variant of searchVariants) {
+        if (eventTitle.includes(variant)) {
+          score += 20 + (variant.length / searchTitle.length) * 30;
+        }
+      }
+      
+      // Bonus per eventi più recenti
+      const eventDate = new Date(event.start.dateTime || event.start.date);
+      const daysAway = Math.abs(Math.floor((now - eventDate) / (24 * 60 * 60 * 1000)));
+      if (daysAway < 3) {
+        score += (3 - daysAway) * 10;
+      }
+    }
+    
+    logger.debug(`Punteggio per "${event.summary}": ${score}`);
+    
+    if (score > bestMatchScore) {
+      bestMatchScore = score;
+      bestMatch = event;
+    }
+  }
+  
+  // Utilizza una soglia minima per considerare una corrispondenza valida
+  if (bestMatch && bestMatchScore > 20) {
+    logger.debug(`Migliore corrispondenza: "${bestMatch.summary}" con punteggio ${bestMatchScore}`);
+    return bestMatch.id;
+  }
+  
+  // Fallback: se cerchiamo "la riunione" e c'è solo una riunione oggi/domani, usala
+  if (searchTitle.includes('riunione') && !searchTitle.includes('con')) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const dayAfterTomorrow = new Date(tomorrow);
+    dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 1);
+    
+    const recentMeetings = searchResponse.data.items.filter(event => {
+      const eventDate = new Date(event.start.dateTime || event.start.date);
+      return eventDate >= today && eventDate < dayAfterTomorrow && 
+             event.summary.toLowerCase().includes('riunione');
+    });
+    
+    if (recentMeetings.length === 1) {
+      logger.debug(`Utilizzando l'unica riunione trovata: ${recentMeetings[0].summary}`);
+      return recentMeetings[0].id;
+    }
+  }
+  
+  throw new Error(`Evento "${title}" non trovato. Prova a specificare un titolo più preciso.`);
+};
+
+/**
+ * SOSTITUISCI COMPLETAMENTE la funzione updateEvent esistente
+ * con questa versione migliorata
  */
 const updateEvent = async (auth, params) => {
   logger.debug('Aggiornamento evento con parametri:', params);
@@ -94,8 +294,38 @@ const updateEvent = async (auth, params) => {
     // Prima dobbiamo trovare l'evento da aggiornare
     let eventId = params.eventId;
     
+    // Se non abbiamo un ID, proviamo a utilizzare il contesto
+    if (!eventId) {
+      eventId = getLastEventIdFromContext();
+      logger.debug('ID evento dal contesto:', eventId);
+    }
+    
+    // Se ancora non abbiamo un ID e abbiamo un titolo, cerchiamo per titolo
     if (!eventId && params.title) {
-      eventId = await findEventByTitle(calendar, params.title);
+      logger.debug('Tentativo di trovare evento per titolo:', params.title);
+      try {
+        eventId = await findEventByTitle(calendar, params.title);
+        logger.debug('Evento trovato per titolo con ID:', eventId);
+      } catch (searchError) {
+        logger.warn('Errore nella ricerca per titolo:', searchError.message);
+        // Fallback: cerchiamo qualsiasi evento recente che corrisponda al tipo
+        if (params.title.includes('riunione') || params.title.toLowerCase().includes('meeting')) {
+          logger.debug('Tentativo di trovare una riunione recente');
+          try {
+            eventId = await findMostRecentEventByType(calendar, 'riunione');
+            logger.debug('Trovata riunione recente con ID:', eventId);
+          } catch (fallbackError) {
+            logger.error('Errore nel trovare evento recente:', fallbackError.message);
+            throw new Error(`Impossibile trovare l'evento da modificare: ${searchError.message}`);
+          }
+        } else {
+          throw searchError;
+        }
+      }
+    }
+    
+    if (!eventId) {
+      throw new Error('ID evento non specificato e impossibile trovare evento dal titolo');
     }
     
     // Ottieni l'evento esistente
@@ -107,6 +337,13 @@ const updateEvent = async (auth, params) => {
     const existingEvent = eventResponse.data;
     logger.debug('Evento esistente trovato:', existingEvent.id);
     
+    // Calcoliamo la durata dell'evento originale (in millisecondi)
+    const originalStartDate = new Date(existingEvent.start.dateTime || existingEvent.start.date);
+    const originalEndDate = new Date(existingEvent.end.dateTime || existingEvent.end.date);
+    const originalDuration = originalEndDate.getTime() - originalStartDate.getTime();
+    
+    logger.debug(`Durata originale dell'evento: ${originalDuration / 60000} minuti`);
+    
     // Prepara l'evento aggiornato
     const updatedEvent = {
       ...existingEvent,
@@ -114,11 +351,12 @@ const updateEvent = async (auth, params) => {
       description: params.description !== undefined ? params.description : existingEvent.description,
     };
     
+    // Gestione modifiche temporali
+    if (params.timeModification) {
+      handleTimeModification(params.timeModification, originalStartDate, originalEndDate, updatedEvent, originalDuration);
+    }
     // Gestione spostamento relativo (ore in avanti/indietro)
-    if (params.hoursToShift) {
-      const originalStartDate = new Date(existingEvent.start.dateTime || existingEvent.start.date);
-      const originalEndDate = new Date(existingEvent.end.dateTime || existingEvent.end.date);
-      
+    else if (params.hoursToShift) {
       // Calcola nuovi orari sommando/sottraendo ore
       const hoursToAdd = params.hoursToShift;
       const newStartDateTime = new Date(originalStartDate.getTime() + hoursToAdd * 60 * 60 * 1000);
@@ -137,50 +375,95 @@ const updateEvent = async (auth, params) => {
       logger.debug(`Spostamento relativo: ${hoursToAdd} ore. Nuovo orario: ${newStartDateTime.toLocaleTimeString()}`);
     }
     // Aggiornamento orario specifico
-    else if (params.date || params.startTime) {
-      const originalStartDate = new Date(existingEvent.start.dateTime || existingEvent.start.date);
-      const startDateTime = prepareDateTime(
-        params.date || originalStartDate,
-        params.startTime || dateUtils.formatTime(originalStartDate)
-      );
+    else if (params.startTime) {
+      // Crea una nuova data di inizio con l'orario specificato
+      const startTimeParts = params.startTime.split(':').map(Number);
+      const newStartDateTime = new Date(originalStartDate);
+      newStartDateTime.setHours(startTimeParts[0], startTimeParts[1], 0, 0);
+      
+      // Calcola la nuova data di fine mantenendo la durata originale
+      const newEndDateTime = new Date(newStartDateTime.getTime() + originalDuration);
+      
+      logger.debug(`Nuovo orario: ${newStartDateTime.toLocaleTimeString()}, fine: ${newEndDateTime.toLocaleTimeString()}`);
       
       updatedEvent.start = {
-        dateTime: startDateTime.toISOString(),
+        dateTime: newStartDateTime.toISOString(),
         timeZone: 'Europe/Rome',
       };
       
-      // Se abbiamo solo modificato l'ora di inizio ma non di fine, 
-      // aggiorna l'ora di fine mantenendo la stessa durata
-      if (params.startTime && !params.endTime) {
-        const originalDuration = new Date(existingEvent.end.dateTime || existingEvent.end.date) - 
-                                new Date(existingEvent.start.dateTime || existingEvent.start.date);
-        
-        const endDateTime = new Date(startDateTime.getTime() + originalDuration);
-        
-        updatedEvent.end = {
-          dateTime: endDateTime.toISOString(),
-          timeZone: 'Europe/Rome',
-        };
-      }
+      updatedEvent.end = {
+        dateTime: newEndDateTime.toISOString(),
+        timeZone: 'Europe/Rome',
+      };
       
-      // Aggiorna ora di fine se fornita
+      // Se è fornito anche un orario di fine specifico, usalo invece
       if (params.endTime) {
-        const startDate = new Date(updatedEvent.start.dateTime);
-        const endDateTime = prepareDateTime(
-          params.date || startDate,
-          params.endTime
-        );
+        const endTimeParts = params.endTime.split(':').map(Number);
+        newEndDateTime.setHours(endTimeParts[0], endTimeParts[1], 0, 0);
+        
+        // Verifica che la nuova fine sia dopo l'inizio
+        if (newEndDateTime <= newStartDateTime) {
+          // Se la fine è prima dell'inizio, aggiungi un giorno
+          newEndDateTime.setDate(newEndDateTime.getDate() + 1);
+        }
         
         updatedEvent.end = {
-          dateTime: endDateTime.toISOString(),
+          dateTime: newEndDateTime.toISOString(),
           timeZone: 'Europe/Rome',
         };
       }
     }
+    // Aggiornamento data specifica
+    else if (params.date) {
+      // Calcola la differenza in giorni tra la data originale e quella richiesta
+      const targetDate = dateUtils.parseDateFromText(params.date);
+      
+      // Mantieni gli stessi orari originali ma aggiorna la data
+      const newStartDateTime = new Date(targetDate);
+      newStartDateTime.setHours(
+        originalStartDate.getHours(),
+        originalStartDate.getMinutes(),
+        originalStartDate.getSeconds()
+      );
+      
+      // Calcola la differenza in giorni
+      const daysDiff = Math.floor((newStartDateTime - originalStartDate) / (24 * 60 * 60 * 1000));
+      
+      // Aggiorna anche la data di fine con lo stesso numero di giorni
+      const newEndDateTime = new Date(originalEndDate);
+      newEndDateTime.setDate(newEndDateTime.getDate() + daysDiff);
+      
+      logger.debug(`Spostamento di ${daysDiff} giorni. Nuova data: ${newStartDateTime.toLocaleDateString()}`);
+      
+      updatedEvent.start = {
+        dateTime: newStartDateTime.toISOString(),
+        timeZone: 'Europe/Rome',
+      };
+      
+      updatedEvent.end = {
+        dateTime: newEndDateTime.toISOString(),
+        timeZone: 'Europe/Rome',
+      };
+    }
     
-    // Aggiorna partecipanti se forniti
+    // Gestione partecipanti con supporto per aggiunta vs. sostituzione
     if (params.attendees && params.attendees.length > 0) {
-      updatedEvent.attendees = prepareAttendees(params.attendees);
+      if (params.attendeesAction === 'ADD') {
+        // Combina partecipanti esistenti e nuovi
+        const existingEmails = existingEvent.attendees ? existingEvent.attendees.map(a => a.email) : [];
+        const newAttendees = params.attendees.filter(email => !existingEmails.includes(email));
+        
+        updatedEvent.attendees = [
+          ...(existingEvent.attendees || []),
+          ...prepareAttendees(newAttendees)
+        ];
+        
+        logger.debug('Aggiunti nuovi partecipanti:', newAttendees);
+      } else {
+        // Sostituisci partecipanti (comportamento predefinito)
+        updatedEvent.attendees = prepareAttendees(params.attendees);
+        logger.debug('Sostituiti partecipanti con:', params.attendees);
+      }
     } else if (params.attendees && params.attendees.length === 0 && existingEvent.attendees) {
       // Mantieni i partecipanti esistenti se l'array è vuoto
       updatedEvent.attendees = existingEvent.attendees;
@@ -193,6 +476,9 @@ const updateEvent = async (auth, params) => {
       eventId: eventId,
       resource: updatedEvent,
     });
+    
+    // Aggiorna il contesto dopo un'operazione riuscita
+    updateEventContext(response.data.id, updatedEvent.summary);
     
     logger.info('Evento aggiornato con successo:', response.data.id);
     
@@ -353,65 +639,44 @@ const deleteEvent = async (auth, params) => {
 };
 
 /**
- * Cerca un evento per titolo
- * @param {Object} calendar - Client Google Calendar
- * @param {String} title - Titolo da cercare
- * @returns {String} ID dell'evento trovato
+ * Aggiunto: Gestisce modifiche temporali relative (anticipo/posticipo)
+ * Aggiungi questa funzione nuova al file
  */
-const findEventByTitle = async (calendar, title) => {
-  logger.debug('Ricerca evento per titolo:', title);
+const handleTimeModification = (timeModification, originalStartDate, originalEndDate, updatedEvent, originalDuration) => {
+  logger.debug('Applicazione modifica temporale:', timeModification);
   
-  // Cerca eventi recenti
-  const now = new Date();
-  const oneWeekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const oneMonthAhead = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  // Calcola lo spostamento in millisecondi
+  let shiftMs = 0;
   
-  const searchResponse = await calendar.events.list({
-    calendarId: 'primary',
-    timeMin: oneWeekAgo.toISOString(),
-    timeMax: oneMonthAhead.toISOString(),
-    maxResults: 20,
-    singleEvents: true,
-    orderBy: 'startTime',
-  });
-  
-  if (!searchResponse.data.items || searchResponse.data.items.length === 0) {
-    throw new Error(`Nessun evento trovato per il periodo ricercato`);
+  if (timeModification.unit === 'HOUR') {
+    shiftMs = timeModification.amount * 60 * 60 * 1000;
+  } else if (timeModification.unit === 'MINUTE') {
+    shiftMs = timeModification.amount * 60 * 1000;
   }
   
-  // Normalizza il titolo di ricerca e crea varianti
-  const searchTitle = title.toLowerCase();
-  const searchVariants = [
-    searchTitle,
-    searchTitle.replace('con', 'di'),
-    searchTitle.replace('di', 'con'),
-    searchTitle.split(' ').pop() // Solo l'ultima parola (es. nome persona)
-  ];
-  
-  // Prima cerca corrispondenza esatta, poi parziale con varianti
-  for (const event of searchResponse.data.items) {
-    const eventTitle = event.summary.toLowerCase();
-    
-    // Corrispondenza esatta
-    if (eventTitle === searchTitle) {
-      return event.id;
-    }
-    
-    // Prova con le varianti
-    if (searchVariants.some(variant => eventTitle.includes(variant))) {
-      logger.debug(`Evento trovato con corrispondenza parziale: ${event.summary}`);
-      return event.id;
-    }
-    
-    // Cerca evento con nome della persona
-    const attendeeMatch = searchTitle.match(/(?:con|di)\s+([A-Za-z]+)/i);
-    if (attendeeMatch && eventTitle.includes(attendeeMatch[1].toLowerCase())) {
-      logger.debug(`Evento trovato con corrispondenza partecipante: ${event.summary}`);
-      return event.id;
-    }
+  // Se la direzione è all'indietro, inverti il segno
+  if (timeModification.direction === 'BACKWARD') {
+    shiftMs = -shiftMs;
+    logger.debug('Applicando spostamento negativo:', -shiftMs/60000, 'minuti');
+  } else {
+    logger.debug('Applicando spostamento positivo:', shiftMs/60000, 'minuti');
   }
   
-  throw new Error(`Evento "${title}" non trovato`);
+  // Calcola i nuovi orari
+  const newStartDateTime = new Date(originalStartDate.getTime() + shiftMs);
+  const newEndDateTime = new Date(originalEndDate.getTime() + shiftMs);
+  
+  logger.debug(`Spostamento di ${shiftMs/60000} minuti. Nuovo orario inizio: ${newStartDateTime.toLocaleTimeString()}`);
+  
+  updatedEvent.start = {
+    dateTime: newStartDateTime.toISOString(),
+    timeZone: 'Europe/Rome',
+  };
+  
+  updatedEvent.end = {
+    dateTime: newEndDateTime.toISOString(),
+    timeZone: 'Europe/Rome',
+  };
 };
 
 /**
@@ -486,5 +751,9 @@ module.exports = {
   createEvent,
   updateEvent,
   listEvents,
-  deleteEvent
+  deleteEvent,
+  handleTimeModification, // Aggiungi questa
+  findMostRecentEventByType, // Aggiungi questa
+  updateEventContext, // Aggiungi questa
+  getLastEventIdFromContext // Aggiungi questa
 };

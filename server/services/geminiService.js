@@ -10,24 +10,14 @@ const logger = createLogger('gemini-service');
 /**
  * Sistema prompt per l'interpretazione dei comandi del calendario
  */
-const SYSTEM_PROMPT = `Sei un assistente che aiuta a gestire il calendario Google. 
-IMPORTANTE: RISPONDI SOLO IN FORMATO JSON.
-Interpreta il comando dell'utente per determinare quale operazione eseguire e restituisci un JSON con questa struttura:
+const SYSTEM_PROMPT = `Sei un assistente specializzato nella gestione del calendario Google.
+IMPORTANTE: RISPONDI ESCLUSIVAMENTE IN FORMATO JSON.
+
+Interpreta il comando dell'utente e restituisci un JSON con questa struttura:
 {
   "action": "[AZIONE]",
   "parameters": {
-    "title": "Titolo evento",
-    "date": "Data evento",
-    "startTime": "Ora inizio",
-    "endTime": "Ora fine",
-    "description": "Descrizione",
-    "attendees": ["nome1", "nome2"],
-    "timeModification": {
-      "type": "SHIFT",
-      "direction": "FORWARD/BACKWARD",
-      "amount": 1,
-      "unit": "HOUR/MINUTE"
-    }
+    // Parametri specifici per l'azione
   }
 }
 
@@ -37,13 +27,9 @@ Dove [AZIONE] deve essere uno di questi valori esatti:
 - "VIEW_EVENTS" (per visualizzare eventi esistenti)
 - "DELETE_EVENT" (per eliminare un evento)
 
-Per comandi come "posticipa", "anticipa", "sposta", aggiungi l'oggetto "timeModification" con:
-- "type": "SHIFT" 
-- "direction": "FORWARD" (per posticipare) o "BACKWARD" (per anticipare)
-- "amount": il numero di unità di tempo
-- "unit": "HOUR" o "MINUTE"
+ESEMPI SPECIFICI PER OGNI TIPO DI COMANDO:
 
-Esempio:
+1. CREAZIONE EVENTI:
 Comando: "Crea una riunione con Mario domani alle 15"
 Risposta:
 {
@@ -57,18 +43,69 @@ Risposta:
   }
 }
 
-Esempio:
-Comando: "Posticipa la riunione con Mario di un'ora"
+2. MODIFICA EVENTI:
+Comando: "Sposta la riunione con Mario alle 16"
 Risposta:
 {
   "action": "UPDATE_EVENT",
   "parameters": {
     "title": "Riunione con Mario",
+    "startTime": "16:00"
+  }
+}
+
+3. VISUALIZZAZIONE EVENTI:
+Comando: "Mostra tutti gli eventi di domani"
+Risposta:
+{
+  "action": "VIEW_EVENTS",
+  "parameters": {
+    "date": "domani",
+    "maxResults": 10
+  }
+}
+
+4. ELIMINAZIONE EVENTI:
+Comando: "Elimina la riunione con Mario"
+Risposta:
+{
+  "action": "DELETE_EVENT",
+  "parameters": {
+    "title": "Riunione con Mario"
+  }
+}
+
+5. CASI SPECIALI:
+Comando: "Elimina tutti gli eventi"
+Risposta:
+{
+  "action": "DELETE_EVENT",
+  "parameters": {
+    "deleteAll": true
+  }
+}
+
+Comando: "Elimina tutto per oggi"
+Risposta:
+{
+  "action": "DELETE_EVENT",
+  "parameters": {
+    "date": "oggi",
+    "deleteAll": true
+  }
+}
+
+Comando: "Anticipa la riunione di domani di 30 minuti"
+Risposta:
+{
+  "action": "UPDATE_EVENT",
+  "parameters": {
+    "date": "domani",
     "timeModification": {
       "type": "SHIFT",
-      "direction": "FORWARD",
-      "amount": 1,
-      "unit": "HOUR"
+      "direction": "BACKWARD",
+      "amount": 30,
+      "unit": "MINUTE"
     }
   }
 }`;
@@ -392,6 +429,14 @@ const normalizeResponse = (parsedResult, originalCommand) => {
     if (!Array.isArray(normalizedParams.attendees)) {
       normalizedParams.attendees = [normalizedParams.attendees];
     }
+    
+    // Controllo se si tratta di aggiunta di partecipanti
+    const lowerCommand = originalCommand.toLowerCase();
+    if (lowerCommand.includes('aggiungi') && 
+        (lowerCommand.includes('alla riunione') || lowerCommand.includes('all\'evento'))) {
+      normalizedParams.attendeesAction = 'ADD';
+      logger.debug('Rilevata azione di aggiunta partecipanti');
+    }
   }
   
   // Gestione della modifica temporale
@@ -427,80 +472,252 @@ const normalizeResponse = (parsedResult, originalCommand) => {
  */
 const parseCommandLocally = (command) => {
   logger.debug('Parsing locale del comando:', command);
-  const lowerCommand = command.toLowerCase();
-  let action = null;
-  let parameters = {};
+  const lowerCommand = command.toLowerCase().trim();
   
-  try {
-    // Nella funzione parseCommandLocally
-    if (lowerCommand.includes('elimina tutto')) {
-      action = 'DELETE_EVENT';
-      parameters = {
-        date: 'oggi',
-        deleteAll: true
-      };
-      logger.debug('Rilevato comando di eliminazione di tutti gli eventi');
-      return { action, parameters };
-    }
+  // SEZIONE 1: COMANDI SPECIALI
+  // Gestione "elimina tutto"
+  if (lowerCommand === 'elimina tutto' || 
+      lowerCommand.includes('elimina tutti gli eventi') || 
+      lowerCommand.includes('cancella tutto')) {
     
-    // Estrazione più accurata del titolo
-    if (lowerCommand.includes('riunione con') || lowerCommand.includes('appuntamento con')) {
-      const match = command.match(/(?:riunione|appuntamento) con ([A-Za-z]+)(?:\s|$)/i);
-      if (match && match[1]) {
-        parameters.title = `Riunione con ${match[1].trim()}`;
-        // Estrai solo il nome della persona come partecipante
-        parameters.attendees = [match[1].trim()]; 
-        logger.debug('Titolo estratto:', parameters.title);
-        logger.debug('Partecipante estratto:', parameters.attendees[0]);
-      }
-    } else {
-      parameters.title = 'Nuovo evento';
-    }
+    logger.debug('Rilevato comando speciale: eliminazione totale');
+    const parameters = { deleteAll: true };
     
-    // Estrai orario
-    const timeMatch = command.match(/(\d{1,2})[:\.]?(\d{2})?\s*$/);
-    if (timeMatch) {
-      const hours = parseInt(timeMatch[1]);
-      const minutes = timeMatch[2] ? parseInt(timeMatch[2]) : 0;
-      parameters.startTime = `${hours}:${minutes || '00'}`;
-      parameters.endTime = `${(hours + 1) % 24}:${minutes || '00'}`;
-      logger.debug('Orario inizio estratto:', parameters.startTime);
-    }
-    
-    // Estrazione della data
+    // Controlla se c'è una data specifica
     if (lowerCommand.includes('oggi')) {
       parameters.date = 'oggi';
     } else if (lowerCommand.includes('domani')) {
       parameters.date = 'domani';
+    } else if (lowerCommand.includes('questa settimana')) {
+      parameters.period = 'current_week';
     }
     
-    // Estrazione delle modifiche temporali
-    const timeModification = extractTimeModification(command);
-    if (timeModification) {
-      parameters.timeModification = timeModification;
-    }
-    
-    // Determina l'azione
-    if (lowerCommand.includes('crea')) {
-      action = 'CREATE_EVENT';
-    } else if (lowerCommand.includes('mostra')) {
-      action = 'VIEW_EVENTS';
-    } else if (lowerCommand.includes('modifica') || lowerCommand.includes('sposta') || 
-               lowerCommand.includes('anticipa') || lowerCommand.includes('posticipa')) {
-      action = 'UPDATE_EVENT';
-    } else if (lowerCommand.includes('elimina')) {
-      action = 'DELETE_EVENT';
-    } else {
-      action = 'VIEW_EVENTS'; // Default modificato a visualizzazione
-    }
-    
-    return { action, parameters };
-  } catch (error) {
-    logger.error('Errore nel parser locale:', error);
-    return {
-      action: 'VIEW_EVENTS',
-      parameters: { maxResults: 5 }
+    return { 
+      action: 'DELETE_EVENT', 
+      parameters 
     };
+  }
+  
+  // SEZIONE 2: DETERMINAZIONE AZIONE PRINCIPALE
+  let action = determineMainAction(lowerCommand);
+  let parameters = {};
+  
+  // SEZIONE 3: ESTRAZIONE TITOLO E PARTECIPANTI
+  extractTitleAndAttendees(lowerCommand, parameters);
+  
+  // SEZIONE 4: ESTRAZIONE DATE E ORARI
+  extractDateAndTime(lowerCommand, parameters);
+  
+  // SEZIONE 5: GESTIONE MODIFICHE TEMPORALI
+  processTemporalModifications(lowerCommand, parameters);
+  
+  // SEZIONE 6: RILEVAMENTO AGGIUNTA PARTECIPANTI
+  if (lowerCommand.includes('aggiungi') && 
+      (lowerCommand.includes('alla riunione') || lowerCommand.includes('all\'evento'))) {
+    parameters.attendeesAction = 'ADD';
+    
+    // Estrai solo il nuovo partecipante, non tutti
+    const matchPerson = lowerCommand.match(/aggiungi\s+([A-Za-z]+)\s+(?:alla|all')/i);
+    if (matchPerson && matchPerson[1]) {
+      parameters.attendees = [matchPerson[1]];
+      logger.debug('Rilevata aggiunta partecipante:', matchPerson[1]);
+    }
+  }
+  
+  return { action, parameters };
+};
+
+/**
+ * Determina l'azione principale dal comando
+ * @param {String} command - Comando in minuscolo
+ * @returns {String} Azione determinata
+ */
+const determineMainAction = (command) => {
+  if (command.includes('crea') || 
+      command.includes('aggiungi') || 
+      command.includes('inserisci') || 
+      command.includes('programma') || 
+      command.includes('organizza')) {
+    return 'CREATE_EVENT';
+  } 
+  
+  if (command.includes('modifica') || 
+      command.includes('aggiorna') || 
+      command.includes('cambia') || 
+      command.includes('sposta') || 
+      command.includes('anticipa') || 
+      command.includes('posticipa')) {
+    return 'UPDATE_EVENT';
+  }
+  
+  if (command.includes('elimina') || 
+      command.includes('cancella') || 
+      command.includes('rimuovi')) {
+    return 'DELETE_EVENT';
+  }
+  
+  if (command.includes('mostra') || 
+      command.includes('visualizza') || 
+      command.includes('elenca') || 
+      command.includes('quali') || 
+      command.includes('trovami')) {
+    return 'VIEW_EVENTS';
+  }
+  
+  // Default: visualizzazione eventi
+  return 'VIEW_EVENTS';
+};
+
+/**
+ * Estrae titolo e partecipanti dal comando
+ * @param {String} command - Comando in minuscolo
+ * @param {Object} parameters - Parametri da popolare
+ */
+const extractTitleAndAttendees = (command, parameters) => {
+  // Estrazione più accurata del titolo
+  let titleMatch = null;
+  let attendees = [];
+  
+  // Pattern per riunioni e appuntamenti
+  if (command.includes('riunione con') || command.includes('appuntamento con')) {
+    titleMatch = command.match(/(?:riunione|appuntamento) con ([A-Za-z]+(?:\s+e\s+[A-Za-z]+)*)(?:\s|$)/i);
+    
+    if (titleMatch && titleMatch[1]) {
+      // Gestione di più partecipanti separati da "e"
+      const participantsText = titleMatch[1].trim();
+      attendees = participantsText.split(/\s+e\s+/).map(p => p.trim());
+      
+      parameters.title = `Riunione con ${participantsText}`;
+      parameters.attendees = attendees;
+    }
+  } 
+  // Pattern per eventi generici
+  else if (command.includes('evento')) {
+    titleMatch = command.match(/evento\s+(?:su|per|di)\s+["']?([^"']+)["']?/i);
+    
+    if (titleMatch && titleMatch[1]) {
+      parameters.title = titleMatch[1].trim();
+    } else {
+      parameters.title = 'Nuovo evento';
+    }
+  }
+  // Default
+  else if (!parameters.title) {
+    parameters.title = 'Nuovo evento';
+  }
+};
+
+/**
+ * Estrae data e orario dal comando
+ * @param {String} command - Comando in minuscolo
+ * @param {Object} parameters - Parametri da popolare
+ */
+const extractDateAndTime = (command, parameters) => {
+  // Estrazione della data
+  if (command.includes('oggi')) {
+    parameters.date = 'oggi';
+  } else if (command.includes('domani')) {
+    parameters.date = 'domani';
+  } else if (command.includes('dopodomani')) {
+    parameters.date = 'dopodomani';
+  }
+  
+  // Estrazione giorni della settimana
+  const weekdayMatch = command.match(/\b(lunedì|martedì|mercoledì|giovedì|venerdì|sabato|domenica)\b/i);
+  if (weekdayMatch) {
+    parameters.date = weekdayMatch[1].toLowerCase();
+    
+    if (command.includes('prossimo') || command.includes('prossima')) {
+      parameters.date = `${parameters.date} prossimo`;
+    }
+  }
+  
+  // Estrai orario
+  const timeMatch = command.match(/(\d{1,2})[:\.]?(\d{2})?\s*$/);
+  if (timeMatch) {
+    const hours = parseInt(timeMatch[1]);
+    const minutes = timeMatch[2] ? parseInt(timeMatch[2]) : 0;
+    parameters.startTime = `${hours}:${minutes < 10 ? '0' + minutes : minutes}`;
+    
+    // Calcola un'ora in più per l'orario di fine predefinito
+    const endHours = (hours + 1) % 24;
+    parameters.endTime = `${endHours}:${minutes < 10 ? '0' + minutes : minutes}`;
+  }
+  
+  // Estrazione orari specifici "alle X"
+  const timeSpecificMatch = command.match(/alle\s+(\d{1,2})(?:[:\.](\d{2}))?/i);
+  if (timeSpecificMatch) {
+    const hours = parseInt(timeSpecificMatch[1]);
+    const minutes = timeSpecificMatch[2] ? parseInt(timeSpecificMatch[2]) : 0;
+    parameters.startTime = `${hours}:${minutes < 10 ? '0' + minutes : minutes}`;
+    
+    // Calcola un'ora in più per l'orario di fine predefinito
+    const endHours = (hours + 1) % 24;
+    parameters.endTime = `${endHours}:${minutes < 10 ? '0' + minutes : minutes}`;
+  }
+};
+
+/**
+ * Analizza modifiche temporali nel comando
+ * @param {String} command - Comando in minuscolo
+ * @param {Object} parameters - Parametri da popolare
+ */
+const processTemporalModifications = (command, parameters) => {
+  // Gestione modifiche temporali relative (avanti/indietro)
+  if (command.includes('ora in avanti') || 
+      command.includes('ore in avanti') || 
+      command.includes('posticipa') || 
+      command.includes('ritarda')) {
+    
+    // Estrai il numero di ore
+    const hourMatch = command.match(/(\d+)\s*or[ae]/i);
+    const hoursToAdd = hourMatch ? parseInt(hourMatch[1]) : 1; // Default a 1 ora
+    
+    parameters.timeModification = {
+      type: "SHIFT",
+      direction: "FORWARD",
+      amount: hoursToAdd,
+      unit: "HOUR"
+    };
+  } 
+  else if (command.includes('ora prima') || 
+           command.includes('ore prima') || 
+           command.includes('anticipa')) {
+    
+    const hourMatch = command.match(/(\d+)\s*or[ae]/i);
+    const hoursToSubtract = hourMatch ? parseInt(hourMatch[1]) : 1; // Default a 1 ora
+    
+    parameters.timeModification = {
+      type: "SHIFT",
+      direction: "BACKWARD",
+      amount: hoursToSubtract,
+      unit: "HOUR"
+    };
+  }
+  
+  // Gestione minuti
+  const minuteMatch = command.match(/(\d+)\s*minut[oi]/i);
+  if (minuteMatch) {
+    const minutes = parseInt(minuteMatch[1]);
+    
+    if (parameters.timeModification) {
+      parameters.timeModification.amount = minutes;
+      parameters.timeModification.unit = "MINUTE";
+    } else if (command.includes('anticipa') || command.includes('prima')) {
+      parameters.timeModification = {
+        type: "SHIFT",
+        direction: "BACKWARD",
+        amount: minutes,
+        unit: "MINUTE"
+      };
+    } else {
+      parameters.timeModification = {
+        type: "SHIFT",
+        direction: "FORWARD",
+        amount: minutes,
+        unit: "MINUTE"
+      };
+    }
   }
 };
 

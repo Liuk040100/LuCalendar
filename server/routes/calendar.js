@@ -37,11 +37,31 @@ router.post('/process-command', requireAuth, async (req, res) => {
     
     logger.debug('Token disponibile, continuo con l\'elaborazione');
     
+    // Nuova funzionalità: preprocessamento del comando
+    const commandPreprocessor = require('../utils/commandPreprocessor');
+    const preprocessed = commandPreprocessor.preprocessCommand(command);
+    logger.trace('Preprocessamento', command, preprocessed);
+    
+    // Se il preprocessore ha identificato una risposta diretta, usala
+    if (preprocessed.metadata.isSpecialCommand && preprocessed.metadata.directResponse) {
+      logger.debug('Rilevato comando speciale con risposta diretta');
+      const result = await executeCalendarAction(
+        preprocessed.metadata.directResponse, 
+        req.oauth2Client
+      );
+      logger.debug('Risultato operazione da comando speciale:', result);
+      return res.json({ result });
+    }
+    
+    // Arricchisci il comando prima di inviarlo a Gemini
+    const enrichedCommand = commandPreprocessor.enrichCommand(preprocessed);
+    logger.trace('Arricchimento', command, enrichedCommand);
+    
     // Utilizza Gemini per interpretare il comando
     logger.debug('Inizio interpretazione comando con Gemini');
     let parsedCommand;
     try {
-      parsedCommand = await geminiService.processCommand(command);
+      parsedCommand = await geminiService.processCommand(enrichedCommand);
       logger.debug('Comando interpretato:', parsedCommand);
     } catch (geminiError) {
       logger.error('Errore specifico nell\'interpretazione del comando:', geminiError);
@@ -58,6 +78,11 @@ router.post('/process-command', requireAuth, async (req, res) => {
         error: 'Impossibile interpretare il comando',
         details: 'Prova a riformulare la richiesta' 
       });
+    }
+    
+    // Arricchisci i parametri con metadati dal preprocessore
+    if (preprocessed.metadata.hasTemporalContext && parsedCommand.parameters) {
+      enrichParametersWithTemporalContext(parsedCommand.parameters, preprocessed.metadata);
     }
     
     // Esegui l'azione appropriata
@@ -85,6 +110,37 @@ router.post('/process-command', requireAuth, async (req, res) => {
     });
   }
 });
+
+/**
+ * Arricchisce i parametri con informazioni temporali dal preprocessore
+ * @param {Object} parameters - Parametri dell'azione
+ * @param {Object} metadata - Metadati dal preprocessore
+ */
+const enrichParametersWithTemporalContext = (parameters, metadata) => {
+  if (!parameters) return;
+  
+  // Se ci sono riferimenti temporali specifici
+  if (metadata.detectedEntities.specificTime && !parameters.startTime) {
+    parameters.startTime = metadata.detectedEntities.specificTime;
+  }
+  
+  // Se c'è una data specifica
+  if (metadata.detectedEntities.specificDate && !parameters.date) {
+    parameters.date = metadata.detectedEntities.specificDate;
+  }
+  
+  // Se c'è un modificatore temporale
+  if (metadata.detectedEntities.modifier) {
+    if (!parameters.timeModification) {
+      parameters.timeModification = {
+        type: "SHIFT",
+        direction: metadata.detectedEntities.modifier === 'hour' ? "FORWARD" : "BACKWARD",
+        amount: metadata.detectedEntities.hourModifier || metadata.detectedEntities.minuteModifier || 1,
+        unit: metadata.detectedEntities.modifier === 'hour' ? "HOUR" : "MINUTE"
+      };
+    }
+  }
+};
 
 /**
  * Esegue l'azione sul calendario in base al comando interpretato
